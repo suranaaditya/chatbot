@@ -111,6 +111,16 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
   .dux-send:disabled{opacity:.4;cursor:not-allowed;transform:none;}
   .dux-foot{text-align:center;color:var(--dimmer);font-size:11px;margin-top:10px;}
   @media (prefers-reduced-motion:reduce){.dux-hero-img,.dux-aura{animation:none;}}
+  .dux-table-wrap{margin-top:10px;background:var(--bg2);border:1px solid var(--line);
+    border-radius:12px;overflow:hidden;overflow-x:auto;}
+  .dux-table{width:100%;border-collapse:collapse;font-size:13px;}
+  .dux-table thead th{background:rgba(255,107,26,.06);color:var(--cream);
+    text-align:left;padding:10px 13px;font-weight:600;font-size:11px;
+    letter-spacing:.06em;text-transform:uppercase;border-bottom:1px solid var(--line);}
+  .dux-table tbody td{padding:10px 13px;border-bottom:1px solid var(--line);
+    color:var(--cream);}
+  .dux-table tbody tr:last-child td{border-bottom:none;}
+  .dux-table tbody tr:hover{background:rgba(255,255,255,.02);}
   </style>`;
 
   const html = `
@@ -193,22 +203,102 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
         <div class="dux-dots"><span></span><span></span><span></span></div></div>`);
     scroll(); return id;
   }
-  function addBot(intent){
-    // ping_llm returns parsed intent JSON for now — render it as a styled card.
-    const dt = intent && intent.doctype ? intent.doctype : '—';
-    const it = intent && intent.intent ? intent.intent : 'unknown';
-    const pretty = JSON.stringify(intent, null, 2);
+  function addBot(response){
+    // Defensive: if backend sent the old raw-intent shape, fall back.
+    if(response && !response.type && response.intent){
+      return addBotIntentCard(response);
+    }
+
+    const type = response && response.type;
+
+    if(type === 'records'){
+      return addBotRecords(response);
+    }
+    if(type === 'unsupported'){
+      return addBotMessage(response.message || 'Not supported yet.');
+    }
+    if(type === 'error'){
+      return addError(response.message || 'Something went wrong.');
+    }
+    return addError('Unexpected response from Dux.');
+  }
+
+  function addBotMessage(text){
     inner.insertAdjacentHTML('beforeend',
-      `<div class="dux-msg bot">
-        <div class="dux-ava"><img src="${MASCOT}"/></div>
-        <div>
-          <div class="dux-bubble">Here's what I understood — wiring this to live ERP data is the next step.</div>
-          <div class="dux-card">
-            <div class="dux-card-h"><span class="dux-badge">${esc(it)}</span><b>${esc(dt)}</b></div>
-            <pre>${esc(pretty)}</pre>
-          </div>
-        </div></div>`);
+      '<div class="dux-msg bot">' +
+        '<div class="dux-ava"><img src="'+MASCOT+'"/></div>' +
+        '<div class="dux-bubble">'+esc(text)+'</div>' +
+      '</div>');
     scroll();
+  }
+
+  function addBotIntentCard(intent){
+    // legacy debug shape — render JSON in the existing card style
+    const dt = intent.doctype || '—';
+    const it = intent.intent || 'unknown';
+    inner.insertAdjacentHTML('beforeend',
+      '<div class="dux-msg bot">' +
+        '<div class="dux-ava"><img src="'+MASCOT+'"/></div>' +
+        '<div><div class="dux-bubble">Here\'s what I understood.</div>' +
+        '<div class="dux-card">' +
+          '<div class="dux-card-h"><span class="dux-badge">'+esc(it)+'</span><b>'+esc(dt)+'</b></div>' +
+          '<pre>'+esc(JSON.stringify(intent,null,2))+'</pre>' +
+        '</div></div>' +
+      '</div>');
+    scroll();
+  }
+
+  function addBotRecords(payload){
+    const dt = payload.doctype || '—';
+    const fields = payload.fields || ['name'];
+    const records = payload.records || [];
+    const count = payload.count || 0;
+
+    let intro;
+    if(count === 0){
+      intro = 'No ' + esc(dt) + ' records matched that.';
+    } else if(count === 1){
+      intro = 'Found 1 ' + esc(dt) + ' record:';
+    } else {
+      intro = 'Found ' + count + ' ' + esc(dt) + ' records:';
+    }
+
+    let table = '';
+    if(count > 0){
+      const head = fields.map(function(f){
+        return '<th>'+esc(prettyField(f))+'</th>';
+      }).join('');
+      const rows = records.map(function(r){
+        const cells = fields.map(function(f){
+          return '<td>'+esc(formatCell(r[f]))+'</td>';
+        }).join('');
+        return '<tr>'+cells+'</tr>';
+      }).join('');
+      table =
+        '<div class="dux-table-wrap"><table class="dux-table">' +
+          '<thead><tr>'+head+'</tr></thead>' +
+          '<tbody>'+rows+'</tbody>' +
+        '</table></div>';
+    }
+
+    inner.insertAdjacentHTML('beforeend',
+      '<div class="dux-msg bot">' +
+        '<div class="dux-ava"><img src="'+MASCOT+'"/></div>' +
+        '<div><div class="dux-bubble">'+intro+'</div>'+table+'</div>' +
+      '</div>');
+    scroll();
+  }
+
+  function prettyField(f){
+    return f.replace(/_/g,' ').replace(/\b\w/g,function(c){return c.toUpperCase();});
+  }
+  function formatCell(v){
+    if(v === null || v === undefined) return '—';
+    if(typeof v === 'number'){
+      // currency-ish formatting for grand_total etc., keep simple
+      return v.toLocaleString();
+    }
+    return String(v);
   }
   function addError(msg){
     inner.insertAdjacentHTML('beforeend',
@@ -224,7 +314,7 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
     input.value=''; autosize(); send.disabled=true;
     const tid = addThinking();
     frappe.call({
-      method:'dux_chatbot.api.ping_llm',
+      method:'dux_chatbot.api.handle_message',
       args:{ message:text },
       callback:function(r){
         const el=document.getElementById(tid); if(el) el.remove();
