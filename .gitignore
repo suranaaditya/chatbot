@@ -1,0 +1,12 @@
+# OS / editor
+.DS_Store
+
+# Claude Code local agent config
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+
+# Full, UNREDACTED internal infra doc — keep local only, never publish
+LLM_INFERENCE_SERVER.local.md
