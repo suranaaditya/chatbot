@@ -1,4 +1,5 @@
 import json
+import time
 from datetime import date
 
 import frappe
@@ -17,6 +18,19 @@ def _ollama_url() -> str:
 # LLM CALL — verified production recipe (think:false MANDATORY)
 # =============================================================================
 def _call_llm(message: str) -> dict:
+    """Call Gemma and return a diagnostics dict for logging:
+
+        {
+            "parsed":     <parsed intent dict>,
+            "raw":        <raw response string BEFORE json.loads>,
+            "variant":    "base" | "with_vocab",
+            "latency_ms": <int wall-time of the HTTP call>,
+        }
+
+    Never raises: LLM-unreachable and JSON-parse failures are surfaced inside
+    ``parsed`` as {"intent": "unknown", ...} so the caller classifies the
+    outcome from the return value rather than from exceptions.
+    """
     system = (
         f"Today is {date.today().isoformat()}. "
         "You are an ERPNext intent classifier. Reply with ONLY valid JSON, "
@@ -26,6 +40,7 @@ def _call_llm(message: str) -> dict:
     )
 
     vocab = frappe.conf.get("chatbot_vocabulary") or {}
+    variant = "with_vocab" if vocab else "base"
     if vocab:
         hints = "\n".join(f'- "{k}" means "{v}"' for k, v in vocab.items())
         system += f"\n\nVocabulary hints for this client:\n{hints}"
@@ -39,18 +54,34 @@ def _call_llm(message: str) -> dict:
         "keep_alive": "5m",
         "options": {"num_predict": 150, "temperature": 0},
     }
+
+    latency_ms = 0
     try:
+        t0 = time.perf_counter()
         resp = requests.post(_ollama_url(), json=payload, timeout=30)
+        latency_ms = int((time.perf_counter() - t0) * 1000)
         resp.raise_for_status()
         raw = resp.json().get("response", "{}")
     except requests.RequestException as e:
         frappe.log_error(f"Ollama request failed: {e}", "dux_chatbot.api")
-        return {"intent": "unknown", "error": "llm_unreachable"}
+        return {
+            "parsed": {"intent": "unknown", "error": "llm_unreachable"},
+            "raw": "",
+            "variant": variant,
+            "latency_ms": latency_ms,
+        }
 
     try:
-        return json.loads(raw)
+        parsed = json.loads(raw)
     except json.JSONDecodeError:
-        return {"intent": "unknown", "raw": raw}
+        parsed = {"intent": "unknown", "raw": raw}
+
+    return {
+        "parsed": parsed,
+        "raw": raw,
+        "variant": variant,
+        "latency_ms": latency_ms,
+    }
 
 
 # =============================================================================
@@ -154,38 +185,130 @@ def _handle_read(intent: dict) -> dict:
 
 
 # =============================================================================
+# LOGGING — persist every turn to the Chatbot Log DocType.
+# Logging MUST NOT break the user flow: _log_turn swallows ALL errors.
+#
+# TODO(retention): Chatbot Log rows accumulate unbounded. A retention/cleanup
+#   strategy (e.g. default_log_clearing_doctypes in hooks.py, or a scheduled
+#   task) should prune old rows. Out of scope for this session — flagged for
+#   a future one.
+# =============================================================================
+def _log_turn(record: dict) -> None:
+    """Persist a Chatbot Log row. NEVER raises — logging must not break the
+    user flow. Failures get a frappe.log_error and are otherwise swallowed."""
+    try:
+        doc = frappe.new_doc("Chatbot Log")
+        doc.update(record)
+        doc.insert(ignore_permissions=True)
+        frappe.db.commit()  # commit the log even if the parent request rolls back
+    except Exception:
+        try:
+            frappe.log_error(frappe.get_traceback(), "Chatbot Log insert failed")
+        except Exception:
+            pass  # truly cannot help further; do not propagate
+
+
+# =============================================================================
 # PUBLIC ENTRY POINTS
 # =============================================================================
 @frappe.whitelist()
 def ping_llm(message: str) -> dict:
-    """Debug endpoint — returns raw intent JSON. Kept for diagnostics."""
-    return _call_llm(message)
+    """Debug endpoint — returns raw parsed intent JSON. Kept for diagnostics."""
+    return _call_llm(message)["parsed"]
 
 
 @frappe.whitelist()
 def handle_message(message: str) -> dict:
-    """The real chat entry point. Returns a typed response the UI can render."""
-    intent = _call_llm(message)
+    """The real chat entry point. Returns a typed response the UI can render.
 
-    if intent.get("intent") == "unknown":
+    Every turn is logged exactly once (success or failure) via the finally
+    block. ``outcome`` is derived from return values — the inner helpers
+    (_call_llm, _handle_read) swallow their own errors and never raise — with
+    a defensive ``except`` for genuinely unexpected exceptions. The ``raise``
+    re-propagates so the user still gets their normal error response; we only
+    record the turn before letting it bubble up.
+    """
+    record = {
+        "timestamp": frappe.utils.now_datetime(),
+        "session_user": frappe.session.user,
+        "session_id": frappe.session.sid,
+        "user_message": message,
+        "prompt_variant": "base",    # overwritten once we know the real variant
+        "result_count": 0,           # 0 for empty / errors unless set on success
+        "outcome": "handler_error",  # overwritten on every known path below
+    }
+    try:
+        llm = _call_llm(message)
+        intent = llm["parsed"]
+        record["prompt_variant"] = llm["variant"]
+        record["llm_latency_ms"] = llm["latency_ms"]
+        record["llm_raw_response"] = llm["raw"]
+        record["parsed_intent"] = intent.get("intent")
+        record["parsed_doctype"] = intent.get("doctype")
+        record["parsed_filters_json"] = json.dumps(intent.get("filters") or {}, default=str)
+
+        intent_type = intent.get("intent")
+
+        # --- LLM-level failures surface as intent == "unknown" ---------------
+        if intent_type == "unknown":
+            if intent.get("error") == "llm_unreachable":
+                record["outcome"] = "llm_error"
+                record["error_message"] = "LLM unreachable"
+            elif "raw" in intent:
+                record["outcome"] = "parse_error"
+                record["error_message"] = "LLM returned non-JSON"
+            else:
+                record["outcome"] = "unknown"
+            return {
+                "type": "error",
+                "intent": intent,
+                "message": "I didn't quite catch that — could you rephrase?",
+            }
+
+        # --- read ------------------------------------------------------------
+        if intent_type == "read":
+            response = _handle_read(intent)
+            rtype = response.get("type")
+            if rtype == "records":
+                doctype = intent.get("doctype")
+                normalized = _normalize_filters(doctype, intent.get("filters", {}))
+                record["normalized_filters_json"] = json.dumps(normalized, default=str)
+                record["executed_call"] = f"frappe.get_list({doctype}, filters={normalized})"
+                record["result_count"] = response.get("count", 0)
+                record["outcome"] = "success" if response.get("count", 0) > 0 else "empty"
+            elif rtype == "unsupported":
+                record["outcome"] = "unsupported"
+            else:  # type == "error": unknown doctype, permission, or get_list failure
+                msg = response.get("message") or ""
+                low = msg.lower()
+                if "permission" in low:
+                    record["outcome"] = "permission_denied"
+                elif "recognize" in low:
+                    record["outcome"] = "unknown"
+                else:
+                    record["outcome"] = "handler_error"
+                record["error_message"] = msg
+            return response
+
+        # --- write (not yet supported) ---------------------------------------
+        if intent_type == "write":
+            record["outcome"] = "unsupported"
+            return {
+                "type": "unsupported",
+                "intent": intent,
+                "message": "Drafting documents is coming soon — for now I can read data.",
+            }
+
+        # --- anything else ---------------------------------------------------
+        record["outcome"] = "unknown"
         return {
             "type": "error",
             "intent": intent,
-            "message": "I didn't quite catch that — could you rephrase?",
+            "message": "I'm not sure how to handle that yet.",
         }
-
-    if intent.get("intent") == "read":
-        return _handle_read(intent)
-
-    if intent.get("intent") == "write":
-        return {
-            "type": "unsupported",
-            "intent": intent,
-            "message": "Drafting documents is coming soon — for now I can read data.",
-        }
-
-    return {
-        "type": "error",
-        "intent": intent,
-        "message": "I'm not sure how to handle that yet.",
-    }
+    except Exception:
+        record["outcome"] = "handler_error"
+        record["error_message"] = frappe.get_traceback()
+        raise
+    finally:
+        _log_turn(record)

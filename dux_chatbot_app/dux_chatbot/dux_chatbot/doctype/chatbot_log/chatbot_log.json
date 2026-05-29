@@ -1,0 +1,166 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "naming_series:",
+ "creation": "2026-05-29 00:00:00",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "naming_series",
+  "timestamp",
+  "session_user",
+  "session_id",
+  "user_message",
+  "prompt_variant",
+  "llm_latency_ms",
+  "llm_raw_response",
+  "parsed_intent",
+  "parsed_doctype",
+  "parsed_filters_json",
+  "normalized_filters_json",
+  "executed_call",
+  "result_count",
+  "outcome",
+  "error_message"
+ ],
+ "fields": [
+  {
+   "default": "CBL-.YYYY.-.MM.-.#####",
+   "fieldname": "naming_series",
+   "fieldtype": "Data",
+   "hidden": 1,
+   "label": "Naming Series",
+   "no_copy": 1,
+   "print_hide": 1,
+   "set_only_once": 1
+  },
+  {
+   "fieldname": "timestamp",
+   "fieldtype": "Datetime",
+   "in_list_view": 1,
+   "label": "Timestamp",
+   "read_only": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "session_user",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Session User",
+   "options": "User",
+   "read_only": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "session_id",
+   "fieldtype": "Data",
+   "label": "Session ID",
+   "read_only": 1
+  },
+  {
+   "fieldname": "user_message",
+   "fieldtype": "Long Text",
+   "label": "User Message",
+   "read_only": 1
+  },
+  {
+   "fieldname": "prompt_variant",
+   "fieldtype": "Select",
+   "label": "Prompt Variant",
+   "options": "base\nwith_vocab\nwith_refinement\nwith_vocab_and_refinement",
+   "read_only": 1
+  },
+  {
+   "fieldname": "llm_latency_ms",
+   "fieldtype": "Int",
+   "label": "LLM Latency (ms)",
+   "read_only": 1
+  },
+  {
+   "fieldname": "llm_raw_response",
+   "fieldtype": "Long Text",
+   "label": "LLM Raw Response",
+   "read_only": 1
+  },
+  {
+   "fieldname": "parsed_intent",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Parsed Intent",
+   "read_only": 1
+  },
+  {
+   "fieldname": "parsed_doctype",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Parsed DocType",
+   "read_only": 1
+  },
+  {
+   "fieldname": "parsed_filters_json",
+   "fieldtype": "Long Text",
+   "label": "Parsed Filters JSON",
+   "read_only": 1
+  },
+  {
+   "fieldname": "normalized_filters_json",
+   "fieldtype": "Long Text",
+   "label": "Normalized Filters JSON",
+   "read_only": 1
+  },
+  {
+   "fieldname": "executed_call",
+   "fieldtype": "Data",
+   "label": "Executed Call",
+   "read_only": 1
+  },
+  {
+   "fieldname": "result_count",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Result Count",
+   "read_only": 1
+  },
+  {
+   "fieldname": "outcome",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Outcome",
+   "options": "success\nempty\nunsupported\npermission_denied\nparse_error\nllm_error\nhandler_error\nunknown",
+   "read_only": 1
+  },
+  {
+   "fieldname": "error_message",
+   "fieldtype": "Long Text",
+   "label": "Error Message",
+   "read_only": 1
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "is_submittable": 0,
+ "links": [],
+ "modified": "2026-05-29 00:00:00",
+ "modified_by": "Administrator",
+ "module": "DUX Chatbot",
+ "name": "Chatbot Log",
+ "naming_rule": "By \"Naming Series\" field",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "track_changes": 0
+}
