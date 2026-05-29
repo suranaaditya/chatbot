@@ -15,6 +15,90 @@ def _ollama_url() -> str:
 
 
 # =============================================================================
+# CONVERSATION MEMORY (p1-10) — last successful read per user, in Redis.
+# Stateless-LLM design preserved: chat history is NOT put in the prompt; only
+# the previous query's doctype + filters are, and only when something is cached.
+# =============================================================================
+LAST_QUERY_TTL_SEC = 8 * 60  # 8-minute sliding TTL — tune from v1.5 logs
+
+
+def _last_query_key() -> str:
+    """Per-user cache key for the last successful read/refine."""
+    return f"dux_chatbot:last_query:{frappe.session.user}"
+
+
+def _get_last_query():
+    """Return the cached last-query dict, or None. Sliding TTL: reading does
+    NOT extend the timer; only a write (via _set_last_query) resets it."""
+    try:
+        return frappe.cache().get_value(_last_query_key())
+    except Exception:
+        return None
+
+
+def _set_last_query(doctype, filters, fields) -> None:
+    """Cache the just-completed read/refine. Resets the 8-min sliding TTL.
+    Caching failures must NEVER break the user flow (same contract as
+    _log_turn) — the user still gets their answer; the next turn just won't
+    have refinement context."""
+    try:
+        frappe.cache().set_value(
+            _last_query_key(),
+            {
+                "doctype": doctype,
+                "filters": filters,
+                "fields": fields,
+                "ts": frappe.utils.now_datetime().isoformat(),
+            },
+            expires_in_sec=LAST_QUERY_TTL_SEC,
+        )
+    except Exception:
+        pass
+
+
+# =============================================================================
+# SYSTEM PROMPTS (p1-10 / p1-11)
+# Two prompts, gated by cache presence. Built from shared pieces so the
+# doctype/filters shape is byte-identical across both; the ONLY differences are
+# (a) refine_read in the intent enum and (b) the CONTEXT block appended to the
+# refinement variant. The today's-date preamble is prepended at call time.
+# SYSTEM_BASE has NO notion of refine_read (decision #31).
+# =============================================================================
+_PROMPT_HEAD = (
+    "You are an ERPNext intent classifier. Reply with ONLY valid JSON, "
+    "no prose, no markdown. Schema: "
+)
+_SCHEMA_BODY = (
+    ',"doctype":"Purchase Order","filters":{"status":"Pending"}}'
+    "\n"
+    "doctype is any ERPNext DocType name in English "
+    "(e.g. Purchase Order, Sales Invoice, Item, Supplier). "
+    "filters is an object of field/value pairs, or {} if none.\n"
+    "- If the message is gibberish, off-topic, or you cannot identify a "
+    'target DocType with confidence, return intent="unknown" with '
+    "doctype=null and empty filters. Do NOT echo schema placeholder "
+    "strings as values."
+)
+SYSTEM_BASE = _PROMPT_HEAD + '{"intent":"read"|"write"|"unknown"' + _SCHEMA_BODY
+SYSTEM_WITH_REFINEMENT = (
+    _PROMPT_HEAD + '{"intent":"read"|"refine_read"|"write"|"unknown"' + _SCHEMA_BODY
+)
+# Appended (formatted) to SYSTEM_WITH_REFINEMENT at call time. Kept separate so
+# .format() only ever touches {doctype}/{filters} here — never the literal JSON
+# braces in _SCHEMA_BODY above.
+REFINEMENT_CONTEXT = (
+    "\n\n"
+    "CONTEXT — previous query in this session:\n"
+    "  doctype: {doctype}\n"
+    "  filters: {filters}\n"
+    'If the user\'s message refines that query, return intent="refine_read" '
+    "with ONLY the new/changed filters in the filters field (do not repeat "
+    "the old filters). If the message is unrelated or starts a fresh query, "
+    'classify it fresh as "read" / "write" / "unknown" as usual.'
+)
+
+
+# =============================================================================
 # LLM CALL — verified production recipe (think:false MANDATORY)
 # =============================================================================
 def _call_llm(message: str) -> dict:
@@ -23,7 +107,7 @@ def _call_llm(message: str) -> dict:
         {
             "parsed":     <parsed intent dict>,
             "raw":        <raw response string BEFORE json.loads>,
-            "variant":    "base" | "with_vocab",
+            "variant":    "base"|"with_vocab"|"with_refinement"|"with_vocab_and_refinement",
             "latency_ms": <int wall-time of the HTTP call>,
         }
 
@@ -31,19 +115,32 @@ def _call_llm(message: str) -> dict:
     ``parsed`` as {"intent": "unknown", ...} so the caller classifies the
     outcome from the return value rather than from exceptions.
     """
-    system = (
-        f"Today is {date.today().isoformat()}. "
-        "You are an ERPNext intent classifier. Reply with ONLY valid JSON, "
-        "no prose, no markdown. Schema: "
-        '{"intent":"read"|"write","doctype":"<DocType>",'
-        '"filters":{...} or "fields":{...}}'
-    )
+    today = f"Today is {date.today().isoformat()}. "
 
+    # p1-10: gate the prompt on cached last-query presence. Read once here for
+    # prompt selection; the refine dispatch in handle_message re-reads to merge
+    # (that second read is what surfaces the rare expiry race it falls through).
+    last_q = _get_last_query()
+    refinement_context = bool(last_q)
+
+    if refinement_context:
+        system = today + SYSTEM_WITH_REFINEMENT + REFINEMENT_CONTEXT.format(
+            doctype=last_q["doctype"],
+            filters=json.dumps(last_q.get("filters") or {}),
+        )
+        base_variant = "with_refinement"
+    else:
+        system = today + SYSTEM_BASE
+        base_variant = "base"
+
+    # Vocab-hint injection (p1-9) — applied on top of the chosen base prompt.
     vocab = frappe.conf.get("chatbot_vocabulary") or {}
-    variant = "with_vocab" if vocab else "base"
     if vocab:
         hints = "\n".join(f'- "{k}" means "{v}"' for k, v in vocab.items())
         system += f"\n\nVocabulary hints for this client:\n{hints}"
+        variant = "with_vocab_and_refinement" if refinement_context else "with_vocab"
+    else:
+        variant = base_variant
 
     payload = {
         "model": "gemma4:e4b",
@@ -265,17 +362,54 @@ def handle_message(message: str) -> dict:
                 "message": "I didn't quite catch that — could you rephrase?",
             }
 
-        # --- read ------------------------------------------------------------
-        if intent_type == "read":
-            response = _handle_read(intent)
+        # --- read / refine_read ----------------------------------------------
+        # refine_read merges the LLM's new filters onto the cached last query
+        # (new wins on conflict) and always reuses the cached doctype. If the
+        # cache expired between the LLM call and here (rare race), fall through
+        # to a fresh read with whatever the LLM gave us — never crash.
+        if intent_type in ("read", "refine_read"):
+            if intent_type == "refine_read":
+                last_q = _get_last_query()
+                if last_q:
+                    merged_filters = {
+                        **(last_q.get("filters") or {}),
+                        **(intent.get("filters") or {}),
+                    }
+                    effective_intent = {
+                        **intent,
+                        "doctype": last_q["doctype"],  # always the cached doctype
+                        "filters": merged_filters,
+                    }
+                else:
+                    # Race fall-through: cache expired between the LLM call and
+                    # dispatch. Treat as a fresh read. No special cache gating
+                    # is needed here — caching below is purely count>0, so an
+                    # empty result on this turn won't cache (same as a fresh read).
+                    effective_intent = intent
+            else:
+                effective_intent = intent
+
+            response = _handle_read(effective_intent)
             rtype = response.get("type")
             if rtype == "records":
-                doctype = intent.get("doctype")
-                normalized = _normalize_filters(doctype, intent.get("filters", {}))
+                doctype = effective_intent.get("doctype")
+                eff_filters = effective_intent.get("filters", {})
+                normalized = _normalize_filters(doctype, eff_filters)
                 record["normalized_filters_json"] = json.dumps(normalized, default=str)
-                record["executed_call"] = f"frappe.get_list({doctype}, filters={normalized})"
+                # Data field is varchar(140); truncate so an over-long merged
+                # filter string can't fail the log insert (p1-13 → Long Text).
+                record["executed_call"] = f"frappe.get_list({doctype}, filters={normalized})"[:140]
                 record["result_count"] = response.get("count", 0)
                 record["outcome"] = "success" if response.get("count", 0) > 0 else "empty"
+                # Cache for future refinement ONLY on a non-empty result —
+                # identical condition for fresh reads and refinements. An empty
+                # or wrong refine must NOT poison the cache for later turns.
+                if response.get("count", 0) > 0:
+                    _set_last_query(
+                        doctype=doctype,
+                        filters=eff_filters,
+                        fields=response.get("fields", []),
+                    )
             elif rtype == "unsupported":
                 record["outcome"] = "unsupported"
             else:  # type == "error": unknown doctype, permission, or get_list failure
@@ -291,6 +425,8 @@ def handle_message(message: str) -> dict:
             return response
 
         # --- write (not yet supported) ---------------------------------------
+        # NOTE: cache is intentionally NOT cleared on write/unknown (locked
+        # design) — users often refer back across a non-read interruption.
         if intent_type == "write":
             record["outcome"] = "unsupported"
             return {
