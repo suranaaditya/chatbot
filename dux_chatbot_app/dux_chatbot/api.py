@@ -24,6 +24,12 @@ def _call_llm(message: str) -> dict:
         '{"intent":"read"|"write","doctype":"<DocType>",'
         '"filters":{...} or "fields":{...}}'
     )
+
+    vocab = frappe.conf.get("chatbot_vocabulary") or {}
+    if vocab:
+        hints = "\n".join(f'- "{k}" means "{v}"' for k, v in vocab.items())
+        system += f"\n\nVocabulary hints for this client:\n{hints}"
+
     payload = {
         "model": "gemma4:e4b",
         "prompt": f'{system}\n\nUser said: "{message}"',
