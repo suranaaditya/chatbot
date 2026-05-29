@@ -1,4 +1,5 @@
 import json
+import re
 import time
 from datetime import date
 
@@ -368,6 +369,11 @@ FIELD_MAP = {
 
 COMPARATORS = {">", "<", ">=", "<=", "!="}
 
+# Leading-operator STRING form Gemma actually emits for above/below queries,
+# e.g. ">50000", ">= 1000" (it rarely emits the structured [op,val]/{op:val}
+# shapes). Longest operators first so >=/<= win over >/<. g1 = op, g2 = operand.
+_STR_COMPARATOR_RE = re.compile(r"^\s*(>=|<=|!=|>|<)\s*(.+)$")
+
 # Real DB columns that aren't always present in meta.fields — whitelisted so
 # field validation (p1-14 part 1) doesn't reject a legitimate filter on them.
 _STD_FIELDS = {
@@ -473,7 +479,18 @@ def _normalize_filters(doctype: str, raw: dict) -> list:
                     and isinstance(alias_entry.get("values"), list) and alias_entry["values"]):
                 out.append([alias_entry["field"], "in", alias_entry["values"]])
                 continue
-            # (2) part 3: loose, case-insensitive Link match. MariaDB's default
+            # (2) part 2 string-form comparator: Gemma emits a leading-operator
+            #     STRING (">50000", ">= 1000") for above/below queries, not the
+            #     structured [op,val] list / {op:val} dict handled below. Parse
+            #     it to a real comparator. Numeric fields coerce the operand;
+            #     Date/other fields pass it through (so "transaction_date >
+            #     2026-01-01" works too). Exact-status and Link values never
+            #     start with an operator, so this won't hijack them.
+            m = _STR_COMPARATOR_RE.match(val)
+            if m:
+                out.append([real_field, m.group(1), _coerce_numeric(m.group(2).strip(), fieldtype, real_field)])
+                continue
+            # (3) part 3: loose, case-insensitive Link match. MariaDB's default
             #     _ci collation makes `like` case-insensitive; `%val%` is
             #     forgiving for partial names ("Bhandari" -> "Bhandari Hardware").
             #     It can match MULTIPLE records (e.g. "Bhandari" -> both Bhandari
@@ -483,7 +500,7 @@ def _normalize_filters(doctype: str, raw: dict) -> list:
             if fieldtype == "Link":
                 out.append([real_field, "like", f"%{_like_escape(val)}%"])
                 continue
-            # (3) case-insensitive Select-option match, then (4) raw -> `=`.
+            # (4) case-insensitive Select-option match, then (5) raw -> `=`.
             real_val = val
             for opt in selects.get(real_field, []):
                 if opt.lower() == val.lower():
