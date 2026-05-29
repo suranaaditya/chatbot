@@ -14,6 +14,7 @@
   "user_message",
   "prompt_variant",
   "llm_latency_ms",
+  "meta_build_ms",
   "llm_raw_response",
   "parsed_intent",
   "parsed_doctype",
@@ -75,6 +76,13 @@
    "fieldname": "llm_latency_ms",
    "fieldtype": "Int",
    "label": "LLM Latency (ms)",
+   "read_only": 1
+  },
+  {
+   "fieldname": "meta_build_ms",
+   "fieldtype": "Int",
+   "in_list_view": 1,
+   "label": "Meta Build (ms)",
    "read_only": 1
   },
   {

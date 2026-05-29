@@ -69,11 +69,15 @@ _PROMPT_HEAD = (
     "no prose, no markdown. Schema: "
 )
 _SCHEMA_BODY = (
-    ',"doctype":"Purchase Order","filters":{"status":"Pending"}}'
+    ',"doctype":"Purchase Order","filters":{"supplier":"Acme Corp"}}'
     "\n"
     "doctype is any ERPNext DocType name in English "
     "(e.g. Purchase Order, Sales Invoice, Item, Supplier). "
     "filters is an object of field/value pairs, or {} if none.\n"
+    "- For status, you may use either an exact status value from the options "
+    'listed under the DocType, OR a common term like "pending", "open", '
+    '"unpaid", "paid", "completed". Both are understood; prefer the user\'s '
+    "own word if they used one of these common terms.\n"
     "- If the message is gibberish, off-topic, or you cannot identify a "
     'target DocType with confidence, return intent="unknown" with '
     "doctype=null and empty filters. Do NOT echo schema placeholder "
@@ -99,9 +103,154 @@ REFINEMENT_CONTEXT = (
 
 
 # =============================================================================
+# META INJECTION (task B) — generalize reads beyond Purchase Order via meta.
+# get_meta_for_doctype is purpose-parameterized so Phase 3's slot-filler can
+# reuse it (write_slots is a stub). Relies on Frappe's built-in (Redis) meta
+# cache — no custom cache layer.
+# =============================================================================
+def get_meta_for_doctype(doctype, purpose):
+    """Return a purpose-scoped view of a DocType's meta.
+
+    Purposes:
+      - "read_filter": {"fields": [{fieldname, fieldtype, label}, ...],
+        "selects": {fieldname: [options]}} — fields the LLM may filter on
+        (Frappe-flagged AND filter-typed); small Selects (<=12 options) carry
+        their options so the LLM can emit exact valid values (retires STATUS_MAP).
+      - "read_display": [fieldname, ...] — result columns, `name` first, capped.
+      - "write_slots": STUB for Phase 3.
+    """
+    meta = frappe.get_meta(doctype)
+
+    if purpose == "read_filter":
+        type_keep = {
+            "Data", "Link", "Select", "Date", "Datetime",
+            "Currency", "Int", "Float", "Check",
+        }
+        fields = []
+        selects = {}
+        for f in meta.fields:
+            flagged = (
+                getattr(f, "in_list_view", 0)
+                or getattr(f, "in_standard_filter", 0)
+                or getattr(f, "search_index", 0)
+                or getattr(f, "reqd", 0)
+            )
+            if not (flagged and f.fieldtype in type_keep):
+                continue
+            fields.append({
+                "fieldname": f.fieldname,
+                "fieldtype": f.fieldtype,
+                "label": f.label or f.fieldname,
+            })
+            if f.fieldtype == "Select" and f.options:
+                opts = [o.strip() for o in f.options.split("\n") if o.strip()]
+                if 0 < len(opts) <= 12:
+                    selects[f.fieldname] = opts
+        return {"fields": fields, "selects": selects}
+
+    if purpose == "read_display":
+        # Chat-optimal columns, fully meta-driven (no per-doctype hardcoding):
+        # name + title (deduped vs its Link shadow) + primary Link fields +
+        # one Currency/amount column + in_list_view fill, capped at 6.
+        cols = ["name"]  # always first — deep-link target (8058de8)
+        title = getattr(meta, "title_field", None)
+
+        # Title field, but skip if it's the *_name shadow of a Link we'll add
+        # anyway (e.g. PO's title_field supplier_name shadows the supplier Link).
+        # Prefer the Link (filterable, canonical) over its _name shadow.
+        link_fieldnames = {
+            f.fieldname for f in meta.fields
+            if f.fieldtype == "Link"
+            and (getattr(f, "in_standard_filter", 0) or getattr(f, "in_list_view", 0))
+        }
+        title_is_link_shadow = (
+            title and any(title == lf + "_name" or title == lf for lf in link_fieldnames)
+        )
+        if title and not title_is_link_shadow and title not in cols:
+            cols.append(title)
+
+        # Primary Link fields — the "who/what" of the record
+        for f in meta.fields:
+            if len(cols) >= 5:  # leave room for an amount column below
+                break
+            if f.fieldtype == "Link" and f.fieldname in link_fieldnames \
+               and f.fieldname not in cols:
+                cols.append(f.fieldname)
+
+        # Ensure one amount/currency column if the doctype has one (chat-useful)
+        if len(cols) < 6:
+            for f in meta.fields:
+                if f.fieldtype == "Currency" and getattr(f, "in_list_view", 0) \
+                   and f.fieldname not in cols:
+                    cols.append(f.fieldname)
+                    break
+
+        # Fill any remaining slots from in_list_view
+        for f in meta.fields:
+            if len(cols) >= 6:
+                break
+            if getattr(f, "in_list_view", 0) and f.fieldname not in cols:
+                cols.append(f.fieldname)
+
+        return cols[:6]
+
+    if purpose == "write_slots":
+        raise NotImplementedError("write_slots — Phase 3")
+
+    raise ValueError(f"Unknown purpose: {purpose}")
+
+
+def _build_meta_context(refinement_doctype=None):
+    """Build the 'Available DocTypes' block injected into the system prompt.
+
+    Returns (context_string, build_ms). Permission-gated: drops DocTypes the
+    session user can't read. On a refinement turn (refinement_doctype set) the
+    cached doctype gets its full read_filter view; others are names-only (lean).
+    On a fresh turn, every candidate gets the light view (name + Select options).
+
+    NEVER raises — same swallow-all contract as _log_turn / _set_last_query. A
+    bad whitelist entry degrades to no-meta (pre-task-B behavior), not a broken
+    turn.
+    """
+    t0 = time.perf_counter()
+    try:
+        whitelist = frappe.conf.get("chatbot_doctypes") or []
+        candidates = [
+            dt for dt in whitelist
+            if frappe.has_permission(dt, "read", user=frappe.session.user)
+        ]
+        if not candidates:
+            return ("", int((time.perf_counter() - t0) * 1000))
+
+        lines = ["", "Available DocTypes:"]
+        for dt in candidates:
+            if dt == refinement_doctype:
+                view = get_meta_for_doctype(dt, "read_filter")
+                field_summary = ", ".join(f["fieldname"] for f in view["fields"][:15])
+                lines.append(f"- {dt} (fields: {field_summary})")
+                for fname, opts in view["selects"].items():
+                    lines.append(f"  {fname} options: {', '.join(opts)}")
+            elif refinement_doctype is not None:
+                lines.append(f"- {dt}")
+            else:
+                view = get_meta_for_doctype(dt, "read_filter")
+                lines.append(f"- {dt}")
+                for fname, opts in view["selects"].items():
+                    lines.append(f"  {fname} options: {', '.join(opts)}")
+        context = "\n".join(lines)
+    except Exception:
+        try:
+            frappe.log_error(frappe.get_traceback(), "Chatbot meta build failed")
+        except Exception:
+            pass
+        context = ""
+    return (context, int((time.perf_counter() - t0) * 1000))
+
+
+# =============================================================================
 # LLM CALL — verified production recipe (think:false MANDATORY)
 # =============================================================================
-def _call_llm(message: str) -> dict:
+def _call_llm(message: str, meta_context: str = "") -> dict:
     """Call Gemma and return a diagnostics dict for logging:
 
         {
@@ -114,6 +263,9 @@ def _call_llm(message: str) -> dict:
     Never raises: LLM-unreachable and JSON-parse failures are surfaced inside
     ``parsed`` as {"intent": "unknown", ...} so the caller classifies the
     outcome from the return value rather than from exceptions.
+
+    System prompt assembly order (task B): schema/rules -> meta context ->
+    vocab hints -> refinement CONTEXT (appended last, by recency).
     """
     today = f"Today is {date.today().isoformat()}. "
 
@@ -123,17 +275,15 @@ def _call_llm(message: str) -> dict:
     last_q = _get_last_query()
     refinement_context = bool(last_q)
 
-    if refinement_context:
-        system = today + SYSTEM_WITH_REFINEMENT + REFINEMENT_CONTEXT.format(
-            doctype=last_q["doctype"],
-            filters=json.dumps(last_q.get("filters") or {}),
-        )
-        base_variant = "with_refinement"
-    else:
-        system = today + SYSTEM_BASE
-        base_variant = "base"
+    # [schema + rules] — refine_read enum only when a cache is present.
+    system = today + (SYSTEM_WITH_REFINEMENT if refinement_context else SYSTEM_BASE)
+    base_variant = "with_refinement" if refinement_context else "base"
 
-    # Vocab-hint injection (p1-9) — applied on top of the chosen base prompt.
+    # [meta context] — candidate DocTypes block (task B), after schema/rules.
+    if meta_context:
+        system += meta_context
+
+    # [vocab hints] (p1-9) — applied on top of the chosen base prompt.
     vocab = frappe.conf.get("chatbot_vocabulary") or {}
     if vocab:
         hints = "\n".join(f'- "{k}" means "{v}"' for k, v in vocab.items())
@@ -141,6 +291,13 @@ def _call_llm(message: str) -> dict:
         variant = "with_vocab_and_refinement" if refinement_context else "with_vocab"
     else:
         variant = base_variant
+
+    # [refinement CONTEXT] — appended LAST so the active query reads as most recent.
+    if refinement_context:
+        system += REFINEMENT_CONTEXT.format(
+            doctype=last_q["doctype"],
+            filters=json.dumps(last_q.get("filters") or {}),
+        )
 
     payload = {
         "model": "gemma4:e4b",
@@ -183,32 +340,54 @@ def _call_llm(message: str) -> dict:
 
 # =============================================================================
 # NORMALIZATION LAYER — translates Gemma's loose JSON to real ERPNext schema.
-# Per-DocType maps; start small, extend as we add DocTypes.
+# STATUS_MAP and DISPLAY_FIELDS are RETIRED (task B): Select values are now
+# canonicalized against the doctype's real meta options, and display columns
+# come from get_meta_for_doctype(..., "read_display"). FIELD_MAP stays — a few
+# known loose field-name aliases (broader entity resolution is p1-14).
 # =============================================================================
 FIELD_MAP = {
     "Purchase Order": {"creation_date": "transaction_date"},
 }
-STATUS_MAP = {
-    "Purchase Order": {
-        "Pending": "To Receive and Bill",
-        "pending": "To Receive and Bill",
-        "Open": "To Receive and Bill",
-    },
-}
-DISPLAY_FIELDS = {
-    "Purchase Order": [
-        "name", "supplier", "transaction_date", "grand_total", "status",
-    ],
-}
 
 
 def _normalize_filters(doctype: str, raw: dict) -> list:
-    """Gemma's loose dict -> frappe.get_list's list-of-lists filter format."""
+    """Gemma's loose dict -> frappe.get_list's list-of-lists filter format.
+
+    Field-aware status semantic layer: a colloquial status term emitted on the
+    status field is looked up in the per-doctype chatbot_status_aliases config,
+    which maps it to {target field, value set} and becomes an `in` filter. The
+    config's "field" lets a term target workflow_state on workflow-enabled sites
+    vs status otherwise (decided per-client; workflow path built but verified
+    for status only). Exact status values fall through to a case-insensitive
+    option match (single `=`), so power-user exact-status queries still work
+    (soften-not-flip). Eventual home is a Desk-editable "Chatbot DocType Config"
+    DocType (parked). Field-name / value entity resolution is p1-14.
+    """
+    try:
+        selects = get_meta_for_doctype(doctype, "read_filter")["selects"]
+    except Exception:
+        selects = {}
+
+    aliases = (frappe.conf.get("chatbot_status_aliases") or {}).get(doctype, {})
+
     out = []
     for key, val in (raw or {}).items():
         real_field = FIELD_MAP.get(doctype, {}).get(key, key)
         if isinstance(val, str):
-            real_val = STATUS_MAP.get(doctype, {}).get(val, val)
+            # (1) field-aware status alias -> `in` filter on the configured
+            #     field. Gated to a status-field emission; a malformed config
+            #     entry skips safely (never raises) and falls through below.
+            alias_entry = aliases.get(val.lower()) if real_field == "status" else None
+            if (isinstance(alias_entry, dict) and alias_entry.get("field")
+                    and isinstance(alias_entry.get("values"), list) and alias_entry["values"]):
+                out.append([alias_entry["field"], "in", alias_entry["values"]])
+                continue
+            # (2) case-insensitive Select-option match, then (3) raw -> `=`.
+            real_val = val
+            for opt in selects.get(real_field, []):
+                if opt.lower() == val.lower():
+                    real_val = opt  # canonical casing from meta
+                    break
             out.append([real_field, "=", real_val])
         elif isinstance(val, dict) and "value" in val and isinstance(val["value"], list):
             out.append([real_field, "between", val["value"]])
@@ -231,20 +410,22 @@ def _handle_read(intent: dict) -> dict:
             "message": f"I don't recognize the record type: {doctype or '(none)'}.",
         }
 
-    # v1 scope: only Purchase Order is wired up. Other DocTypes acknowledged
-    # but not executed — keeps blast radius small while we iterate.
-    if doctype not in DISPLAY_FIELDS:
+    # Chatbot scope = curated whitelist (site_config.chatbot_doctypes). User
+    # permission is enforced separately by frappe.get_list running as the
+    # session user below — this gate is "not wired up for the bot", not "no perm".
+    whitelist = frappe.conf.get("chatbot_doctypes") or []
+    if doctype not in whitelist:
         return {
             "type": "unsupported",
             "intent": intent,
             "message": (
-                f"I understood that you want to read {doctype}, but I'm only "
-                "wired for Purchase Orders right now. More coming soon."
+                f"I understood that you want to read {doctype}, but it's not one "
+                "of the record types I'm set up for yet. More coming soon."
             ),
         }
 
     filters = _normalize_filters(doctype, intent.get("filters", {}))
-    fields = DISPLAY_FIELDS[doctype]
+    fields = get_meta_for_doctype(doctype, "read_display")
 
     try:
         records = frappe.get_list(
@@ -331,11 +512,20 @@ def handle_message(message: str) -> dict:
         "session_id": frappe.session.sid,
         "user_message": message,
         "prompt_variant": "base",    # overwritten once we know the real variant
+        "meta_build_ms": 0,          # set from _build_meta_context below
         "result_count": 0,           # 0 for empty / errors unless set on success
         "outcome": "handler_error",  # overwritten on every known path below
     }
     try:
-        llm = _call_llm(message)
+        # task B: build the candidate-DocType meta block before the LLM call.
+        # Lean on refinement turns (only the cached doctype gets full meta).
+        # meta_build_ms is set here so it logs even if the turn later errors.
+        last_q = _get_last_query()
+        refinement_doctype = last_q["doctype"] if last_q else None
+        meta_context, meta_build_ms = _build_meta_context(refinement_doctype)
+        record["meta_build_ms"] = meta_build_ms
+
+        llm = _call_llm(message, meta_context=meta_context)
         intent = llm["parsed"]
         record["prompt_variant"] = llm["variant"]
         record["llm_latency_ms"] = llm["latency_ms"]
