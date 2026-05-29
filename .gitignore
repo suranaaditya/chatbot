@@ -10,3 +10,7 @@ __pycache__/
 
 # Full, UNREDACTED internal infra doc — keep local only, never publish
 LLM_INFERENCE_SERVER.local.md
+
+# Local-only operational reference — contains dev creds
+DEV_SERVER.md
+*.local.md
