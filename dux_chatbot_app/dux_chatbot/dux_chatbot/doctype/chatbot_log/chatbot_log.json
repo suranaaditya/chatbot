@@ -119,7 +119,7 @@
   },
   {
    "fieldname": "executed_call",
-   "fieldtype": "Data",
+   "fieldtype": "Long Text",
    "label": "Executed Call",
    "read_only": 1
   },
@@ -135,7 +135,7 @@
    "fieldtype": "Select",
    "in_list_view": 1,
    "label": "Outcome",
-   "options": "success\nempty\nunsupported\npermission_denied\nparse_error\nllm_error\nhandler_error\nunknown",
+   "options": "success\nempty\nunsupported\npermission_denied\nquery_error\nparse_error\nllm_error\nhandler_error\nunknown",
    "read_only": 1
   },
   {

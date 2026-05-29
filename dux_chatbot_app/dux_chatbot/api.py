@@ -408,6 +408,7 @@ def _handle_read(intent: dict) -> dict:
             "type": "error",
             "intent": intent,
             "message": f"I don't recognize the record type: {doctype or '(none)'}.",
+            "error_kind": "unknown_doctype",  # caller maps to outcome=unknown
         }
 
     # Chatbot scope = curated whitelist (site_config.chatbot_doctypes). User
@@ -440,13 +441,19 @@ def _handle_read(intent: dict) -> dict:
             "type": "error",
             "intent": intent,
             "message": "You don't have permission to view those records.",
+            "error_kind": "permission_denied",  # caller maps to outcome=permission_denied
         }
-    except Exception as e:
-        frappe.log_error(f"get_list failed for {doctype}: {e}", "dux_chatbot.api")
+    except Exception:
+        # Bad field name, malformed filter, bad operator, etc. — NOT a
+        # permissions problem. The user should rephrase, not contact their
+        # admin. Capture the full traceback in the Error Log so ops can see
+        # the real cause while the user sees only the friendly message.
+        frappe.log_error(frappe.get_traceback(), "Chatbot read query_error")
         return {
             "type": "error",
             "intent": intent,
-            "message": "Something went wrong reading those records.",
+            "message": "I couldn't run that query — I may have misunderstood a field or value. Try rephrasing.",
+            "error_kind": "query_error",  # caller maps to outcome=query_error
         }
 
     link_base = f"/app/{doctype.lower().replace(' ', '-')}"
@@ -586,9 +593,9 @@ def handle_message(message: str) -> dict:
                 eff_filters = effective_intent.get("filters", {})
                 normalized = _normalize_filters(doctype, eff_filters)
                 record["normalized_filters_json"] = json.dumps(normalized, default=str)
-                # Data field is varchar(140); truncate so an over-long merged
-                # filter string can't fail the log insert (p1-13 → Long Text).
-                record["executed_call"] = f"frappe.get_list({doctype}, filters={normalized})"[:140]
+                # executed_call is Long Text (p1-13) — no length cap, so the
+                # full query string (including long multi-filter ones) is logged.
+                record["executed_call"] = f"frappe.get_list({doctype}, filters={normalized})"
                 record["result_count"] = response.get("count", 0)
                 record["outcome"] = "success" if response.get("count", 0) > 0 else "empty"
                 # Cache for future refinement ONLY on a non-empty result —
@@ -602,12 +609,17 @@ def handle_message(message: str) -> dict:
                     )
             elif rtype == "unsupported":
                 record["outcome"] = "unsupported"
-            else:  # type == "error": unknown doctype, permission, or get_list failure
+            else:  # type == "error": unknown doctype, permission, or query error
                 msg = response.get("message") or ""
-                low = msg.lower()
-                if "permission" in low:
+                # Drive the outcome off the explicit error_kind flag set by
+                # _handle_read (p1-15) — every error return now carries one, so
+                # no fragile message text-matching is needed.
+                kind = response.get("error_kind")
+                if kind == "permission_denied":
                     record["outcome"] = "permission_denied"
-                elif "recognize" in low:
+                elif kind == "query_error":
+                    record["outcome"] = "query_error"
+                elif kind == "unknown_doctype":
                     record["outcome"] = "unknown"
                 else:
                     record["outcome"] = "handler_error"
