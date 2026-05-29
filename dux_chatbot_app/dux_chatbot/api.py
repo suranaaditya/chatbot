@@ -134,6 +134,8 @@ def _handle_read(intent: dict) -> dict:
             "message": "Something went wrong reading those records.",
         }
 
+    link_base = f"/app/{doctype.lower().replace(' ', '-')}"
+
     return {
         "type": "records",
         "intent": intent,
@@ -141,6 +143,7 @@ def _handle_read(intent: dict) -> dict:
         "fields": fields,
         "records": records,
         "count": len(records),
+        "link_base": link_base,
     }
 
 

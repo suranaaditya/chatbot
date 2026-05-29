@@ -121,6 +121,8 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
     color:var(--cream);}
   .dux-table tbody tr:last-child td{border-bottom:none;}
   .dux-table tbody tr:hover{background:rgba(255,255,255,.02);}
+  .dux-chat-link{color:var(--accent);text-decoration:none;cursor:pointer;}
+  .dux-chat-link:hover{color:var(--accent);text-decoration:underline;}
   </style>`;
 
   const html = `
@@ -253,6 +255,7 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
     const fields = payload.fields || ['name'];
     const records = payload.records || [];
     const count = payload.count || 0;
+    const linkBase = payload.link_base || '';
 
     let intro;
     if(count === 0){
@@ -270,6 +273,11 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
       }).join('');
       const rows = records.map(function(r){
         const cells = fields.map(function(f){
+          if(f === 'name' && linkBase && r.name){
+            return '<td><a href="'+esc(linkBase)+'/'+encodeURIComponent(r.name)+'" '+
+                   'class="dux-chat-link" target="_blank" rel="noopener">'+
+                   esc(formatCell(r.name))+'</a></td>';
+          }
           return '<td>'+esc(formatCell(r[f]))+'</td>';
         }).join('');
         return '<tr>'+cells+'</tr>';
