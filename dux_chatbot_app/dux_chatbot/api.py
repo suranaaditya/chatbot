@@ -342,12 +342,73 @@ def _call_llm(message: str, meta_context: str = "") -> dict:
 # NORMALIZATION LAYER — translates Gemma's loose JSON to real ERPNext schema.
 # STATUS_MAP and DISPLAY_FIELDS are RETIRED (task B): Select values are now
 # canonicalized against the doctype's real meta options, and display columns
-# come from get_meta_for_doctype(..., "read_display"). FIELD_MAP stays — a few
-# known loose field-name aliases (broader entity resolution is p1-14).
+# come from get_meta_for_doctype(..., "read_display").
+#
+# p1-14 additions:
+#  (1) field pre-validation against meta BEFORE get_list — an unknown filter
+#      field becomes query_error (honest 'rephrase' nudge) instead of Frappe's
+#      misleading PermissionError (this Frappe version raises PermissionError
+#      for unknown filter fields, even as Administrator);
+#  (2) comparator operators (>, <, >=, <=, !=) translated to Frappe filter
+#      syntax, with numeric coercion for Currency/Int/Float fields;
+#  (3) loose case-insensitive `like` matching for Link-field values (cheap
+#      entity-resolution proxy; full version is Phase 2);
+#  (4) FIELD_MAP demoted to a FALLBACK behind the per-site chatbot_field_aliases
+#      config (parallel to chatbot_status_aliases).
 # =============================================================================
 FIELD_MAP = {
+    # Legacy hardcoded field-name aliases — now a FALLBACK behind the per-site
+    # `chatbot_field_aliases` config (p1-14 part 4). creation_date ->
+    # transaction_date is a genuine DOMAIN alias, NOT derivable from meta: the
+    # LLM's "creation_date" means the PO's business date (transaction_date), not
+    # the row's DB `creation` timestamp. Kept so PO date queries don't regress
+    # if the config key is unset.
     "Purchase Order": {"creation_date": "transaction_date"},
 }
+
+COMPARATORS = {">", "<", ">=", "<=", "!="}
+
+# Real DB columns that aren't always present in meta.fields — whitelisted so
+# field validation (p1-14 part 1) doesn't reject a legitimate filter on them.
+_STD_FIELDS = {
+    "name", "creation", "modified", "modified_by", "owner", "docstatus", "idx",
+    "parent", "parenttype", "parentfield",
+}
+
+
+class _FilterError(Exception):
+    """Raised by _normalize_filters when the LLM's filter cannot be built into a
+    valid query — an unknown field name (validated against meta) or an operand
+    that won't coerce for a numeric field. _handle_read maps it to a
+    `query_error` response so the user gets a precise 'rephrase' nudge, instead
+    of the query reaching get_list and surfacing as a misleading PermissionError."""
+
+    pass
+
+
+def _coerce_numeric(operand, fieldtype, fieldname):
+    """Coerce a comparator operand to a number on numeric fields so `>`/`<`
+    compare numerically, not lexically (">" "50000" as a string compare
+    misbehaves). Strips thousands-separator commas first ("50,000" -> 50000).
+    Non-numeric fields (Date, Data, Link, ...) pass the operand through
+    unchanged — Frappe/MariaDB handles e.g. date-string comparison. A
+    non-numeric operand on a numeric field is a query_error."""
+    if fieldtype not in ("Currency", "Float", "Percent", "Int"):
+        return operand
+    cleaned = operand.replace(",", "").strip() if isinstance(operand, str) else operand
+    try:
+        return int(float(cleaned)) if fieldtype == "Int" else float(cleaned)
+    except (TypeError, ValueError):
+        raise _FilterError(
+            f"I couldn't read '{operand}' as a number for '{fieldname}'. Try a numeric value."
+        )
+
+
+def _like_escape(value: str) -> str:
+    """Escape LIKE wildcards (%, _) and the escape char itself so a Link value
+    is matched literally apart from our own surrounding %...% (MariaDB LIKE uses
+    backslash as the default escape char). Plain names have nothing to escape."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _normalize_filters(doctype: str, raw: dict) -> list:
@@ -361,18 +422,48 @@ def _normalize_filters(doctype: str, raw: dict) -> list:
     for status only). Exact status values fall through to a case-insensitive
     option match (single `=`), so power-user exact-status queries still work
     (soften-not-flip). Eventual home is a Desk-editable "Chatbot DocType Config"
-    DocType (parked). Field-name / value entity resolution is p1-14.
+    DocType (parked).
+
+    p1-14 per-filter pipeline: resolve the field name (chatbot_field_aliases
+    config -> legacy FIELD_MAP -> as-is) -> validate the resolved field against
+    the doctype meta (unknown -> _FilterError -> query_error) -> build the
+    filter: status alias (`in`), comparator (`>`/`<`/`>=`/`<=`/`!=` with numeric
+    coercion), loose Link match (`like %val%`), Select canonicalization (`=`),
+    between, or plain `=`.
     """
+    try:
+        meta = frappe.get_meta(doctype)
+        field_types = {f.fieldname: f.fieldtype for f in meta.fields}
+        valid_fields = set(field_types) | _STD_FIELDS
+    except Exception:
+        # Meta unavailable (unexpected — doctype is validated upstream in
+        # _handle_read). Degrade to pre-p1-14 behavior: skip validation rather
+        # than false-reject every filter.
+        field_types = {}
+        valid_fields = None
+
     try:
         selects = get_meta_for_doctype(doctype, "read_filter")["selects"]
     except Exception:
         selects = {}
 
     aliases = (frappe.conf.get("chatbot_status_aliases") or {}).get(doctype, {})
+    field_aliases = (frappe.conf.get("chatbot_field_aliases") or {}).get(doctype, {})
 
     out = []
     for key, val in (raw or {}).items():
-        real_field = FIELD_MAP.get(doctype, {}).get(key, key)
+        # [field-name resolution] config field-alias -> legacy FIELD_MAP -> as-is.
+        real_field = field_aliases.get(key) or FIELD_MAP.get(doctype, {}).get(key, key)
+
+        # [part 1: validate the RESOLVED field BEFORE building/querying anything].
+        # Catching wrong fields here keeps Frappe's PermissionError (raised for
+        # unknown filter fields) meaning ONLY a genuine access denial.
+        if valid_fields is not None and real_field not in valid_fields:
+            raise _FilterError(
+                f"I don't recognize the field '{key}' on {doctype}. Could you rephrase?"
+            )
+        fieldtype = field_types.get(real_field)
+
         if isinstance(val, str):
             # (1) field-aware status alias -> `in` filter on the configured
             #     field. Gated to a status-field emission; a malformed config
@@ -382,13 +473,31 @@ def _normalize_filters(doctype: str, raw: dict) -> list:
                     and isinstance(alias_entry.get("values"), list) and alias_entry["values"]):
                 out.append([alias_entry["field"], "in", alias_entry["values"]])
                 continue
-            # (2) case-insensitive Select-option match, then (3) raw -> `=`.
+            # (2) part 3: loose, case-insensitive Link match. MariaDB's default
+            #     _ci collation makes `like` case-insensitive; `%val%` is
+            #     forgiving for partial names ("Bhandari" -> "Bhandari Hardware").
+            #     It can match MULTIPLE records (e.g. "Bhandari" -> both Bhandari
+            #     Hardware AND Bhandari Printers) — acceptable for v1: the user
+            #     sees the list and refines. Top-N disambiguation is Phase 2
+            #     entity resolution (ChromaDB).
+            if fieldtype == "Link":
+                out.append([real_field, "like", f"%{_like_escape(val)}%"])
+                continue
+            # (3) case-insensitive Select-option match, then (4) raw -> `=`.
             real_val = val
             for opt in selects.get(real_field, []):
                 if opt.lower() == val.lower():
                     real_val = opt  # canonical casing from meta
                     break
             out.append([real_field, "=", real_val])
+        # part 2: comparator as a 2-element [op, value] list, e.g. [">", 50000].
+        elif isinstance(val, list) and len(val) == 2 and val[0] in COMPARATORS:
+            out.append([real_field, val[0], _coerce_numeric(val[1], fieldtype, real_field)])
+        # part 2: comparator as a single-key {op: value} dict, e.g. {">": 50000}.
+        elif isinstance(val, dict) and len(val) == 1 and next(iter(val)) in COMPARATORS:
+            op, operand = next(iter(val.items()))
+            out.append([real_field, op, _coerce_numeric(operand, fieldtype, real_field)])
+        # between: {"value": [lo, hi]}.
         elif isinstance(val, dict) and "value" in val and isinstance(val["value"], list):
             out.append([real_field, "between", val["value"]])
         else:
@@ -425,7 +534,18 @@ def _handle_read(intent: dict) -> dict:
             ),
         }
 
-    filters = _normalize_filters(doctype, intent.get("filters", {}))
+    try:
+        filters = _normalize_filters(doctype, intent.get("filters", {}))
+    except _FilterError as e:
+        # p1-14 part 1: wrong field / unparseable operand caught BEFORE get_list
+        # — honest query_error (user should rephrase), distinct from the
+        # PermissionError / generic except blocks around get_list below.
+        return {
+            "type": "error",
+            "intent": intent,
+            "message": str(e),
+            "error_kind": "query_error",  # caller maps to outcome=query_error
+        }
     fields = get_meta_for_doctype(doctype, "read_display")
 
     try:
