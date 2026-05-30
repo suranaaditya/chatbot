@@ -133,6 +133,35 @@ EVAL_CASES = [
     {"id": "item_specific", "query": "can you give me stock of 200mm DI", "kind": "level3",
      "intent": "read", "doctype": "Item", "nonempty": True},
 
+    # ---- refine-vs-fresh classification steer (p15-6) — seeded cases warm the
+    #      cache so the REFINEMENT prompt fires (variant-sanity in _checks_for
+    #      proves the seed took). A message that NAMES WHAT TO FETCH must classify
+    #      `read` (line 794: read bypasses the cache => stack dropped, by code). ----
+    {"id": "refine_fresh_win_incident",  # WIN: the CBL-00151 incident — must flip to read
+     "query": "need all the po of jain engineering", "kind": "level2",
+     "seed": {"doctype": "Purchase Order",
+              "filters": {"company": "jain engineering", "grand_total": "<50000",
+                          "supplier": "abhijeet", "status": "Draft"}},
+     "intent": "read", "doctype": "Purchase Order",
+     "carried_absent": ["abhijeet", "grand_total", "Draft"]},
+    {"id": "refine_fresh_win_draft_po",  # WIN: names po -> read; resets to just Draft
+     "query": "can i get all the draft po", "kind": "level2",
+     "seed": {"doctype": "Purchase Order",
+              "filters": {"company": "jain engineering", "grand_total": "<50000",
+                          "supplier": "abhijeet"}},
+     "intent": "read", "doctype": "Purchase Order",
+     "filters": [["status", "=", "Draft"]]},
+    {"id": "refine_constraint_only_tripwire",  # NON-NEGOTIABLE (clause 1): must STAY refine + merge
+     "query": "less than 25000", "kind": "level2",
+     "seed": {"doctype": "Purchase Order", "filters": {"status": "pending"}},
+     "intent": "refine_read",
+     "filters": [["status", "in", ["To Receive and Bill", "To Bill", "To Receive"]],
+                 ["grand_total", "<", 25000.0]]},
+    {"id": "refine_from_only_tripwire",  # soft boundary (clause 2): "from X only" stays refine
+     "query": "from company dux only", "kind": "level2",
+     "seed": {"doctype": "Purchase Order", "filters": {"status": "pending"}},
+     "intent": "refine_read"},
+
     # ---- known behavior / limitations ----
     # Field-baked comparator limitation — phrasing-DETERMINISTIC (measured n=10):
     # the conversational "can you show me po..." prefix makes Gemma hallucinate a
@@ -201,6 +230,7 @@ def _filters_equal(actual, expected):
 # HARNESS
 # =============================================================================
 _captured = {}
+_seed = None  # per-case last_query seed for warm-cache (refinement) cases; None = cold/fresh
 
 
 def _setup_frappe():
@@ -218,7 +248,7 @@ def _patch(api):
         _captured.clear()
         _captured.update(record)
     api._log_turn = capture
-    api._get_last_query = lambda: None
+    api._get_last_query = lambda: _seed          # None -> cold (fresh); dict -> warm (refinement prompt + merge)
     api._set_last_query = lambda *a, **k: None
 
 
@@ -234,36 +264,53 @@ def _invoke(api, query):
 
 
 def _checks_for(case, rec):
-    """Return (list of (name, ok), info-string) for a real (level2/level3) case."""
+    """Return (list of (name, ok), info-string) for a real (level2/level3) case.
+    Checks are conditional on the case's keys, so a refinement case can assert
+    intent alone (TRIP-WIRE-2) or carried-absent (WIN-1) without pinning exact
+    filters. The variant check is a SEED-SANITY guard: a seeded case MUST run the
+    refinement prompt — if a seed silently fails to warm, variant stays with_vocab
+    and the case fails, instead of a false green on the cold prompt."""
     intent = rec.get("parsed_intent")
     doctype = rec.get("parsed_doctype")
     count = rec.get("result_count", 0) or 0
     nfj = rec.get("normalized_filters_json")
     actual = json.loads(nfj) if nfj else None
-    outcome = rec.get("outcome")
+    variant = rec.get("prompt_variant")
 
-    checks = [("intent", intent == case["intent"]),
-              ("doctype", doctype == case["doctype"])]
-    if case["kind"] == "level2":
+    checks = [("intent", intent == case["intent"])]
+    if "doctype" in case:
+        checks.append(("doctype", doctype == case["doctype"]))
+    if "filters" in case:
         checks.append(("filters", _filters_equal(actual, case["filters"])))
+    if case.get("carried_absent"):
+        checks.append(("carried-absent",
+                       not any(s in (nfj or "") for s in case["carried_absent"])))
     if case.get("nonempty"):
         checks.append(("nonempty", count > 0))
-    info = f"intent={intent} dt={doctype} outcome={outcome} count={count} filters={actual}"
+    exp_variant = "with_vocab_and_refinement" if case.get("seed") else "with_vocab"
+    checks.append(("variant", variant == exp_variant))
+    info = (f"intent={intent} dt={doctype} variant={variant} "
+            f"outcome={rec.get('outcome')} count={count} filters={actual}")
     return checks, info
 
 
 def _eval_real(api, case):
-    rec = _invoke(api, case["query"])
-    checks, info = _checks_for(case, rec)
-    ok = all(v for _, v in checks)
-    flaky = False
-    if not ok:  # one retry to separate a hard fail from LLM flakiness
-        rec2 = _invoke(api, case["query"])
-        checks2, info2 = _checks_for(case, rec2)
-        if all(v for _, v in checks2):
-            ok, flaky, checks, info = True, True, checks2, info2
-        else:
-            checks, info = checks2, info2  # report the (stable) failing run
+    global _seed
+    _seed = case.get("seed")  # warm the cache for refinement cases; None = cold
+    try:
+        rec = _invoke(api, case["query"])
+        checks, info = _checks_for(case, rec)
+        ok = all(v for _, v in checks)
+        flaky = False
+        if not ok:  # one retry to separate a hard fail from LLM flakiness
+            rec2 = _invoke(api, case["query"])
+            checks2, info2 = _checks_for(case, rec2)
+            if all(v for _, v in checks2):
+                ok, flaky, checks, info = True, True, checks2, info2
+            else:
+                checks, info = checks2, info2  # report the (stable) failing run
+    finally:
+        _seed = None  # UNCONDITIONAL reset — a thrown seeded case must not warm the next
     status = "FLAKY" if flaky else ("PASS" if ok else "FAIL")
     return {"case": case, "ok": ok, "status": status, "checks": checks, "info": info}
 

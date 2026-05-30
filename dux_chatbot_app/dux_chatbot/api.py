@@ -100,10 +100,23 @@ REFINEMENT_CONTEXT = (
     "CONTEXT — previous query in this session:\n"
     "  doctype: {doctype}\n"
     "  filters: {filters}\n"
-    'If the user\'s message refines that query, return intent="refine_read" '
-    "with ONLY the new/changed filters in the filters field (do not repeat "
-    "the old filters). If the message is unrelated or starts a fresh query, "
-    'classify it fresh as "read" / "write" / "unknown" as usual.'
+    "Decide between a NEW query and a refinement by whether the message NAMES "
+    "WHAT TO FETCH:\n"
+    "- If it names a record type (purchase order/po, purchase invoice, item, "
+    "supplier, ...) OR an entity as the thing requested (e.g. \"pos of supplier "
+    "X\", \"show X's invoices\", \"all the draft po\"), it is a NEW query: "
+    'return intent="read" (or "write"/"unknown") and do NOT reuse the previous '
+    "filters.\n"
+    "- Return intent=\"refine_read\" ONLY when the message adds a constraint to "
+    "the previous results WITHOUT naming what to fetch: a bare number/comparator "
+    "(\"less than 25000\", \"above 50000\") or a narrowing like \"from X only\" "
+    "/ \"only X\" / \"only the pending ones\". Put ONLY the new/changed filters "
+    "in the filters field; do not repeat the old filters.\n"
+    "Examples (a previous query exists in every case):\n"
+    '  "need all the po of jain engineering" -> read (names po; new query)\n'
+    '  "can i get all the draft po" -> read (names po; new query)\n'
+    '  "less than 25000" -> refine_read (constraint only; names nothing)\n'
+    '  "from company dux only" -> refine_read (constraint only; names nothing)'
 )
 
 
