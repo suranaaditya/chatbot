@@ -693,6 +693,13 @@ def _handle_read(intent: dict) -> dict:
         "records": records,
         "count": len(records),
         "link_base": link_base,
+        # The post-normalization filter list that ACTUALLY queried ERPNext above.
+        # Surfaced to the UI (read-only) so it can render transparent "filter
+        # pills" showing which filters produced this result. Visual-layer only —
+        # identical to what _log_turn records as normalized_filters_json. This is
+        # the lone backend touch for the UI revamp; classification / normalization
+        # / refinement logic is untouched.
+        "normalized_filters": filters,
     }
 
 
