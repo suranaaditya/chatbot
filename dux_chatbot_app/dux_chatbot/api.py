@@ -79,6 +79,10 @@ _SCHEMA_BODY = (
     'listed under the DocType, OR a common term like "pending", "open", '
     '"unpaid", "paid", "completed". Both are understood; prefer the user\'s '
     "own word if they used one of these common terms.\n"
+    "- For amount/number comparisons (more than, less than, above, below), put "
+    "the operator INSIDE the value as a string on a real field, e.g. "
+    '{"grand_total":">50000"} or {"grand_total":"<25000"}. NEVER put the '
+    'operator in the field name (not "grand_total[<]", not "amount_less_than").\n'
     "- If the message is gibberish, off-topic, or you cannot identify a "
     'target DocType with confidence, return intent="unknown" with '
     "doctype=null and empty filters. Do NOT echo schema placeholder "
