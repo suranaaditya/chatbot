@@ -95,6 +95,26 @@ EVAL_CASES = [
     # be mis-calibrated, and a supplier result is redundant with loose_link_*.
     # Tracked instead as the parked "unreliable company-field routing" gap.
 
+    # ---- company routing rescue (p15-1c) — the base model dumps company names
+    #      into `supplier`; resolve_company reroutes exact/aliased company values to
+    #      `company` (= exact), while real suppliers stay on supplier (like). The
+    #      Jain case proves the "jain engineering" alias entry, not just Dux. ----
+    {"id": "company_exact", "query": "po of company Dux Digitech", "kind": "level2",
+     "intent": "read", "doctype": "Purchase Order",
+     "filters": [["company", "=", "Dux Digitech"]], "nonempty": True},
+    {"id": "company_alias", "query": "po of company dux", "kind": "level2",
+     "intent": "read", "doctype": "Purchase Order",
+     "filters": [["company", "=", "Dux Digitech"]], "nonempty": True},
+    {"id": "company_alias_jain", "query": "po of company Jain Engineering", "kind": "level2",
+     "intent": "read", "doctype": "Purchase Order",
+     "filters": [["company", "=", "Jain Engineering Works (India) Private Limited"]], "nonempty": True},
+    {"id": "supplier_regression", "query": "po of Bhandari", "kind": "level2",
+     "intent": "read", "doctype": "Purchase Order",
+     "filters": [["supplier", "like", "%Bhandari%"]]},
+    {"id": "keyword_conflict_regression", "query": "po of company Bhandari", "kind": "level2",
+     "intent": "read", "doctype": "Purchase Order",
+     "filters": [["supplier", "like", "%Bhandari%"]]},
+
     # ---- multi-filter (status alias + loose Link in one fresh turn) ----
     {"id": "multi_filter", "query": "show pending purchase orders from Bhandari Hardware", "kind": "level2",
      "intent": "read", "doctype": "Purchase Order",

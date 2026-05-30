@@ -437,6 +437,36 @@ def _is_plausible_field(name) -> bool:
     return bool(_PLAUSIBLE_FIELD_RE.match(name)) and not _BAKED_SUFFIX_RE.search(name)
 
 
+def resolve_company(value):
+    """Resolve an LLM-emitted name to a canonical Company name, or None (p15-1c).
+
+    Deterministic, EXACT + ALIAS only — NOT loose substring (with 66 companies a
+    substring rule would false-positive a supplier value onto a company). Order:
+      1. case-insensitive EXACT match of `value` against the Company master
+         (Company names are unique, so this yields at most one);
+      2. else case-insensitive lookup of `value` in the per-site
+         `chatbot_company_aliases` map, returning its canonical ONLY if that
+         canonical itself exists in the Company master (so a typo'd alias canonical
+         falls through to None -> supplier, never a filter on a dead company);
+      3. else None.
+    Never raises: a Company-read failure -> None -> existing supplier handling.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    v = value.strip().lower()
+    try:
+        by_lower = {n.lower(): n for n in frappe.get_all("Company", pluck="name")}
+    except Exception:
+        return None
+    if v in by_lower:                       # (1) ci-exact against the master
+        return by_lower[v]
+    aliases = frappe.conf.get("chatbot_company_aliases") or {}   # (2) validated alias
+    for k, canon in aliases.items():
+        if isinstance(k, str) and k.lower() == v and isinstance(canon, str):
+            return by_lower.get(canon.lower())  # master casing, or None if alias canonical is dead
+    return None
+
+
 def _normalize_filters(doctype: str, raw: dict) -> list:
     """Gemma's loose dict -> frappe.get_list's list-of-lists filter format.
 
@@ -527,6 +557,17 @@ def _normalize_filters(doctype: str, raw: dict) -> list:
             #     sees the list and refines. Top-N disambiguation is Phase 2
             #     entity resolution (ChromaDB).
             if fieldtype == "Link":
+                # p15-1c: the model routes company names to `supplier` (it can't
+                # entity-type, and ignores the "company" keyword — STEP-0 probe).
+                # Deterministically rescue a value that resolves to exactly one
+                # Company (ci-exact or via chatbot_company_aliases) and is NOT also
+                # a real Supplier -> filter on `company`. Real suppliers / ambiguous
+                # names keep the loose-Link wildcard unchanged.
+                if real_field == "supplier":
+                    canonical = resolve_company(val)
+                    if canonical and not frappe.db.exists("Supplier", val):
+                        out.append(["company", "=", canonical])
+                        continue
                 out.append([real_field, "like", f"%{_like_escape(val)}%"])
                 continue
             # (4) case-insensitive Select-option match, then (5) raw -> `=`.
