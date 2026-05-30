@@ -417,6 +417,22 @@ def _like_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+# A "plausible" field name is a clean identifier that does NOT bake a comparator
+# into the name. The field-validation message branches on this (p15-1): a
+# plausible-but-wrong field (e.g. total_amount, nonexistent_field) keeps the
+# precise p1-15 message (it helps the user spot the right field); a mangled
+# token — brackets/operators (grand_total[<], amount[<]) or a baked comparator
+# word-suffix (amount_less_than) — gets a generic rephrase hint instead of
+# echoing nonsense back at the user.
+_PLAUSIBLE_FIELD_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
+_BAKED_SUFFIX_RE = re.compile(r"_(less|greater|more|fewer)_than$", re.IGNORECASE)
+
+
+def _is_plausible_field(name) -> bool:
+    name = str(name)
+    return bool(_PLAUSIBLE_FIELD_RE.match(name)) and not _BAKED_SUFFIX_RE.search(name)
+
+
 def _normalize_filters(doctype: str, raw: dict) -> list:
     """Gemma's loose dict -> frappe.get_list's list-of-lists filter format.
 
@@ -465,8 +481,17 @@ def _normalize_filters(doctype: str, raw: dict) -> list:
         # Catching wrong fields here keeps Frappe's PermissionError (raised for
         # unknown filter fields) meaning ONLY a genuine access denial.
         if valid_fields is not None and real_field not in valid_fields:
+            if _is_plausible_field(key):
+                # Real-word wrong field (e.g. total_amount) — the precise p1-15
+                # message helps the user spot/correct it. Byte-identical to before.
+                raise _FilterError(
+                    f"I don't recognize the field '{key}' on {doctype}. Could you rephrase?"
+                )
+            # Field-baked / mangled token (grand_total[<], amount[<],
+            # amount_less_than) — never echo it; give an actionable example (p15-1).
             raise _FilterError(
-                f"I don't recognize the field '{key}' on {doctype}. Could you rephrase?"
+                "I couldn't parse that filter. Try rephrasing — "
+                'for example, "POs above 50000" or "POs less than 25000".'
             )
         fieldtype = field_types.get(real_field)
 
