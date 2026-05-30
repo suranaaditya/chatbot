@@ -9,6 +9,22 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
 
   const MASCOT = '/assets/dux_chatbot/images/dux-mascot.png';
 
+  // --- DUX per-tab id: scopes the refinement cache to THIS tab (p15-7) ---------
+  // sessionStorage = per-tab, survives reload, cleared on tab close. Do NOT move
+  // to localStorage (shared across tabs) or regenerate per page-load (breaks
+  // reload continuity). Self-contained — keep this block intact through any UI
+  // revamp; submit() passes duxTabId() to handle_message as tab_id.
+  function duxTabId() {
+    let id = sessionStorage.getItem('dux_tab_id');
+    if (!id) {
+      id = (window.crypto && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : String(Date.now()) + Math.random().toString(16).slice(2);
+      sessionStorage.setItem('dux_tab_id', id);
+    }
+    return id;
+  }
+
   const style = `
   <style>
   @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
@@ -323,7 +339,7 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
     const tid = addThinking();
     frappe.call({
       method:'dux_chatbot.api.handle_message',
-      args:{ message:text },
+      args:{ message:text, tab_id:duxTabId() },
       callback:function(r){
         const el=document.getElementById(tid); if(el) el.remove();
         if(r && r.message){ addBot(r.message); } else { addError('No response from Dux.'); }

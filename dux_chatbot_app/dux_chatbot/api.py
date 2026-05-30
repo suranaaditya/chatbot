@@ -20,12 +20,19 @@ def _ollama_url() -> str:
 # Stateless-LLM design preserved: chat history is NOT put in the prompt; only
 # the previous query's doctype + filters are, and only when something is cached.
 # =============================================================================
-LAST_QUERY_TTL_SEC = 8 * 60  # 8-minute sliding TTL — tune from v1.5 logs
+LAST_QUERY_TTL_SEC = 4 * 60  # 4-minute sliding TTL (was 8*60; shortened p15-7)
 
 
 def _last_query_key() -> str:
-    """Per-user cache key for the last successful read/refine."""
-    return f"dux_chatbot:last_query:{frappe.session.user}"
+    """Cache key for the last successful read/refine. Scoped per-USER, and
+    per-TAB when a browser tab id is present (p15-7): handle_message stashes the
+    frontend sessionStorage UUID in frappe.flags.dux_tab_id (request-scoped), so
+    two tabs of one login get separate refinement memories. A falsy/absent tab id
+    falls back to the user-only key (eval, scripts, console) — deterministic, and
+    keeps _get_last_query/_set_last_query arg-less so the eval override holds."""
+    base = f"dux_chatbot:last_query:{frappe.session.user}"
+    tab = getattr(frappe.flags, "dux_tab_id", None)
+    return f"{base}:{tab}" if tab else base
 
 
 def _get_last_query():
@@ -723,7 +730,7 @@ def ping_llm(message: str) -> dict:
 
 
 @frappe.whitelist()
-def handle_message(message: str) -> dict:
+def handle_message(message: str, tab_id: str = None) -> dict:
     """The real chat entry point. Returns a typed response the UI can render.
 
     Every turn is logged exactly once (success or failure) via the finally
@@ -733,6 +740,12 @@ def handle_message(message: str) -> dict:
     re-propagates so the user still gets their normal error response; we only
     record the turn before letting it bubble up.
     """
+    # p15-7: stash the frontend per-tab id (sessionStorage UUID) request-scoped so
+    # _last_query_key() scopes the refinement cache to THIS tab. Guarded on a
+    # truthy tab_id — an empty/None value falls through to the user-only key
+    # (matching the eval/script path), never an empty ":"-suffixed key fragment.
+    if tab_id:
+        frappe.flags.dux_tab_id = tab_id
     record = {
         "timestamp": frappe.utils.now_datetime(),
         "session_user": frappe.session.user,
