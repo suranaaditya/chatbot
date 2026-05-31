@@ -16,6 +16,75 @@ def _ollama_url() -> str:
 
 
 # =============================================================================
+# CONFIG ACCESSORS — dual-read layer for the config-registry refactor.
+# The four PER-DOCTYPE config layers are consolidated into ONE `chatbot_registry`
+# object keyed by DocType; these accessors PREFER the registry and FALL BACK to
+# the legacy flat keys, so the migration is reversible and behavior-identical.
+#
+# ALL-OR-NOTHING: if `chatbot_registry` exists and is non-empty it is the COMPLETE
+# source of truth and the legacy keys (chatbot_doctypes / _vocabulary /
+# _field_aliases / _status_aliases) are IGNORED — there is NO half-registry /
+# half-legacy merge. Once the registry is verified on a site, the legacy keys are
+# deleted with no behavior change (separate follow-up commit). The accessors are
+# the single place the eventual deletion touches.
+# `chatbot_company_aliases` is GLOBAL (not per-doctype) and is ALWAYS read
+# top-level — it never moves into the registry.
+#
+# Registry shape:
+#   {"<DocType>": {"vocab": ["<term>", ...],
+#                  "field_aliases": {"<alias>": "<field>"},
+#                  "status_aliases": {"<term>": {"field": "<f>", "values": [...]}}},
+#    ...}
+# =============================================================================
+def _cfg_registry() -> dict:
+    return frappe.conf.get("chatbot_registry") or {}
+
+
+def _cfg_doctypes() -> list:
+    """Allow-list. Registry keys when the registry is present, else the legacy
+    chatbot_doctypes list. Dict insertion order is preserved, so registry key
+    order == the old list order (keeps the prompt's DocType block stable)."""
+    reg = _cfg_registry()
+    return list(reg.keys()) if reg else (frappe.conf.get("chatbot_doctypes") or [])
+
+
+def _cfg_vocabulary() -> dict:
+    """FLAT {term: doctype} — the shape _call_llm consumes. From the registry,
+    invert per-doctype {dt: [terms]} -> {term: dt}. Non-empty iff the source is
+    non-empty (_call_llm keys prompt_variant off vocab presence, so an empty
+    flatten would flip the variant). Else the legacy flat chatbot_vocabulary."""
+    reg = _cfg_registry()
+    if reg:
+        out = {}
+        for dt, entry in reg.items():
+            for term in ((entry or {}).get("vocab") or []):
+                out[term] = dt
+        return out
+    return frappe.conf.get("chatbot_vocabulary") or {}
+
+
+def _cfg_field_aliases(doctype: str) -> dict:
+    """Per-doctype {alias: field}. Registry-first, else legacy chatbot_field_aliases."""
+    reg = _cfg_registry()
+    if reg:
+        return (reg.get(doctype) or {}).get("field_aliases", {})
+    return (frappe.conf.get("chatbot_field_aliases") or {}).get(doctype, {})
+
+
+def _cfg_status_aliases(doctype: str) -> dict:
+    """Per-doctype {term: {field, values}}. Registry-first, else legacy chatbot_status_aliases."""
+    reg = _cfg_registry()
+    if reg:
+        return (reg.get(doctype) or {}).get("status_aliases", {})
+    return (frappe.conf.get("chatbot_status_aliases") or {}).get(doctype, {})
+
+
+def _cfg_company_aliases() -> dict:
+    """GLOBAL colloquial->Company map — always top-level, never in the registry."""
+    return frappe.conf.get("chatbot_company_aliases") or {}
+
+
+# =============================================================================
 # CONVERSATION MEMORY (p1-10) — last successful read per user, in Redis.
 # Stateless-LLM design preserved: chat history is NOT put in the prompt; only
 # the previous query's doctype + filters are, and only when something is cached.
@@ -239,7 +308,7 @@ def _build_meta_context(refinement_doctype=None):
     """
     t0 = time.perf_counter()
     try:
-        whitelist = frappe.conf.get("chatbot_doctypes") or []
+        whitelist = _cfg_doctypes()
         candidates = [
             dt for dt in whitelist
             if frappe.has_permission(dt, "read", user=frappe.session.user)
@@ -309,7 +378,7 @@ def _call_llm(message: str, meta_context: str = "") -> dict:
         system += meta_context
 
     # [vocab hints] (p1-9) — applied on top of the chosen base prompt.
-    vocab = frappe.conf.get("chatbot_vocabulary") or {}
+    vocab = _cfg_vocabulary()
     if vocab:
         hints = "\n".join(f'- "{k}" means "{v}"' for k, v in vocab.items())
         system += f"\n\nVocabulary hints for this client:\n{hints}"
@@ -480,7 +549,7 @@ def resolve_company(value):
         return None
     if v in by_lower:                       # (1) ci-exact against the master
         return by_lower[v]
-    aliases = frappe.conf.get("chatbot_company_aliases") or {}   # (2) validated alias
+    aliases = _cfg_company_aliases()   # (2) validated alias
     for k, canon in aliases.items():
         if isinstance(k, str) and k.lower() == v and isinstance(canon, str):
             return by_lower.get(canon.lower())  # master casing, or None if alias canonical is dead
@@ -523,8 +592,8 @@ def _normalize_filters(doctype: str, raw: dict) -> list:
     except Exception:
         selects = {}
 
-    aliases = (frappe.conf.get("chatbot_status_aliases") or {}).get(doctype, {})
-    field_aliases = (frappe.conf.get("chatbot_field_aliases") or {}).get(doctype, {})
+    aliases = _cfg_status_aliases(doctype)
+    field_aliases = _cfg_field_aliases(doctype)
 
     out = []
     for key, val in (raw or {}).items():
@@ -630,7 +699,7 @@ def _handle_read(intent: dict) -> dict:
     # Chatbot scope = curated whitelist (site_config.chatbot_doctypes). User
     # permission is enforced separately by frappe.get_list running as the
     # session user below — this gate is "not wired up for the bot", not "no perm".
-    whitelist = frappe.conf.get("chatbot_doctypes") or []
+    whitelist = _cfg_doctypes()
     if doctype not in whitelist:
         return {
             "type": "unsupported",
@@ -734,6 +803,30 @@ def _log_turn(record: dict) -> None:
 def ping_llm(message: str) -> dict:
     """Debug endpoint — returns raw parsed intent JSON. Kept for diagnostics."""
     return _call_llm(message)["parsed"]
+
+
+@frappe.whitelist()
+def chatbot_registry_status() -> dict:
+    """Read-only completeness view (System Manager only): per registered DocType,
+    which config layers are populated + the live record count. The standing,
+    one-call version of the manual config audit ("what's configured vs not").
+    Reads through the same accessors, so it reflects the ACTIVE source (registry
+    when present, else the legacy keys)."""
+    frappe.only_for("System Manager")
+    vocab = _cfg_vocabulary()
+    out = {}
+    for dt in _cfg_doctypes():
+        try:
+            count = frappe.db.count(dt)
+        except Exception:
+            count = None
+        out[dt] = {
+            "vocab": bool([t for t, d in vocab.items() if d == dt]),
+            "field_aliases": bool(_cfg_field_aliases(dt)),
+            "status_aliases": bool(_cfg_status_aliases(dt)),
+            "records": count,
+        }
+    return out
 
 
 @frappe.whitelist()
