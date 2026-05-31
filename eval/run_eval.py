@@ -120,14 +120,42 @@ EVAL_CASES = [
      "intent": "read", "doctype": "Purchase Order",
      "filters": [["status", "in", PENDING_PO], ["supplier", "like", "%Bhandari Hardware%"]]},
 
-    # ---- Purchase Invoice option-match status (no alias entry) ----
-    {"id": "pi_option_status", "query": "show unpaid purchase invoices", "kind": "level2",
+    # ---- Purchase Invoice "unpaid" — NOW an alias (was exact option-match before the
+    #      status-alias fill this batch). The fill is the intended gap-close, so this
+    #      existing case deliberately flips ["status","=","Unpaid"] -> the alias set,
+    #      mirroring Sales Invoice. [Unpaid,Overdue] is a superset of the previously
+    #      non-empty Unpaid, so the smoke still holds. ----
+    {"id": "pi_unpaid_alias", "query": "show unpaid purchase invoices", "kind": "level2",
      "intent": "read", "doctype": "Purchase Invoice",
-     "filters": [["status", "=", "Unpaid"]], "nonempty": True},
+     "filters": [["status", "in", ["Unpaid", "Overdue"]]], "nonempty": True},
     # ---- Sales Invoice alias status (doctype named to avoid the invoice ambiguity gap) ----
     {"id": "si_alias_status", "query": "show unpaid sales invoices", "kind": "level2",
      "intent": "read", "doctype": "Sales Invoice",
      "filters": [["status", "in", ["Unpaid", "Overdue"]]]},
+
+    # ---- Purchase Receipt — FIRST new-doctype registration into chatbot_registry.
+    #      THE reported bug: "purchase receipt" used to route to Purchase Invoice; now
+    #      registered, it routes to Purchase Receipt AND passes the _handle_read whitelist
+    #      gate (the two things that were missing). 11 records -> non-empty smoke. ----
+    {"id": "pr_routing", "query": "show me purchase receipts", "kind": "level2",
+     "intent": "read", "doctype": "Purchase Receipt",
+     "filters": [], "nonempty": True},
+    # PR status alias "pending" -> [To Bill, Partly Billed]. Assert the FILTER SHAPE
+    # regardless of count (records may not be in those states -> no non-empty smoke).
+    {"id": "pr_pending", "query": "pending purchase receipts", "kind": "level2",
+     "intent": "read", "doctype": "Purchase Receipt",
+     "filters": [["status", "in", ["To Bill", "Partly Billed"]]]},
+
+    # ---- Purchase Invoice status-alias fill (the gap closed this batch) ----
+    # "pending" -> [Unpaid, Overdue]: this filter could NOT have been produced before the
+    # fill (PInv had empty status_aliases) — proves the gap is closed.
+    {"id": "pi_pending", "query": "pending purchase invoices", "kind": "level2",
+     "intent": "read", "doctype": "Purchase Invoice",
+     "filters": [["status", "in", ["Unpaid", "Overdue"]]]},
+    # "paid" -> [Paid] via the new alias (a status=Paid filter present, as the prompt wants).
+    {"id": "pi_paid", "query": "paid purchase invoices", "kind": "level2",
+     "intent": "read", "doctype": "Purchase Invoice",
+     "filters": [["status", "in", ["Paid"]]]},
 
     # ---- level-3 only: value-specific item lookup (field varies item_name/item_code) ----
     {"id": "item_specific", "query": "can you give me stock of 200mm DI", "kind": "level3",
