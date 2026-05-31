@@ -58,6 +58,8 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
     moon:     ic('<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>'),
     sun:      ic('<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"/>'),
     chevron:  ic('<path d="m15 18-6-6 6-6"/>'),
+    layers:   ic('<path d="m12 3 9 5-9 5-9-5z"/><path d="m3 13 9 5 9-5"/>'),
+    refresh:  ic('<path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 4v4h-4"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 20v-4h4"/>'),
   };
 
   const style = `
@@ -318,6 +320,21 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
   .dux-composer-zone::before{content:"";position:absolute;left:0;right:0;top:-42px;height:42px;
     background:linear-gradient(180deg,transparent,var(--canvas));pointer-events:none;}
   .dux-composer-inner{max-width:860px;margin:0 auto;}
+
+  /* live filter-context strip (current refinement cache, above the composer) */
+  .dux-ctx-strip{display:flex;align-items:center;gap:10px;margin-bottom:10px;padding:7px 8px 7px 13px;
+    border-radius:12px;background:var(--surface-1);border:1px solid var(--hairline);
+    box-shadow:var(--inset-hi);animation:duxSettle .4s var(--spring) both;}
+  .dux-ctx-lead{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--fg-3);white-space:nowrap;}
+  .dux-ctx-lead .dux-ic{width:13px;height:13px;color:var(--iris);}
+  .dux-ctx-lead b{color:var(--fg-1);font-family:var(--mono);}
+  .dux-ctx-chips{display:flex;gap:6px;flex-wrap:wrap;flex:1 1 auto;min-width:0;}
+  .dux-ctx-chip{font-size:11px;padding:3px 8px;border-radius:7px;background:rgba(109,94,246,.10);
+    border:1px solid rgba(109,94,246,.22);color:var(--fg-1);white-space:nowrap;}
+  .dux-ctx-chip .num{font-family:var(--mono);color:var(--cyan);}
+  .dux-ctx-strip .dux-btn-new{flex:0 0 auto;}
+  @media (max-width:720px){ .dux-ctx-lead small,.dux-ctx-strip .dux-btn-new span{white-space:nowrap;} }
+
   .dux-composer{position:relative;display:flex;align-items:flex-end;gap:10px;padding:11px 11px 11px 16px;
     border-radius:var(--r-xl);background:var(--surface-1);border:1px solid var(--hairline-2);
     box-shadow:var(--shadow-pop),var(--inset-hi);transition:border-color .3s var(--ease);}
@@ -383,6 +400,7 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
     <div class="dux-stream" id="dux-stream"><div class="dux-inner" id="dux-inner"></div></div>
 
     <div class="dux-composer-zone"><div class="dux-composer-inner">
+      <div id="dux-ctx"></div>
       <div class="dux-composer shimmer" id="dux-composer">
         <span class="dux-lead-glyph">${IC.sparkle}</span>
         <textarea class="dux-input" id="dux-input" rows="1"
@@ -430,7 +448,19 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
   const input    = document.getElementById('dux-input');
   const send     = document.getElementById('dux-send');
   const composer = document.getElementById('dux-composer');
+  const ctxMount = document.getElementById('dux-ctx');
   let emptyEl = null;
+
+  // Live refinement-context state. Mirrors api.py's per-tab last_query cache:
+  // LAST_QUERY_TTL_SEC = 4*60 (sliding) — the backend (re)writes it ONLY on a
+  // count>0 read/refine, and reading does NOT extend it. Keep CTX_TTL_MS in sync
+  // with that server constant. On expiry the strip clears, so the user always
+  // sees exactly which filters are (and are no longer) carried into the next turn.
+  const CTX_TTL_MS = 4 * 60 * 1000;
+  const PH_DEFAULT = 'Ask about purchase orders, suppliers, amounts…';
+  const PH_REFINE  = 'Refine within these filters, or start a new search…';
+  let contextChips = [];
+  let contextTimer = null;
 
   const esc = s => (s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
   const scroll = () => { requestAnimationFrame(() => { stream.scrollTop = stream.scrollHeight; }); };
@@ -743,6 +773,83 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
   }
 
   // =========================================================================
+  // LIVE FILTER CONTEXT — a persistent strip above the composer showing the
+  // refinement filters CURRENTLY cached on the backend (per-tab, 4-min sliding
+  // TTL). Mirrors the server: only a count>0 records turn (re)writes the cache,
+  // so only that updates the strip + resets the timer; on expiry the strip
+  // clears, so the user always knows what is (and isn't) still in the filter.
+  // =========================================================================
+  function renderContextStrip() {
+    if (!ctxMount) return;
+    if (!contextChips.length) { ctxMount.innerHTML = ''; return; }
+    const chips = contextChips.map(function (c) {
+      return '<span class="dux-ctx-chip">' + esc(c.klabel || 'Filter') + ': '
+        + '<span' + (c.isNum ? ' class="num"' : '') + '>' + esc(c.value) + '</span></span>';
+    }).join('');
+    ctxMount.innerHTML =
+      '<div class="dux-ctx-strip">'
+      + '<span class="dux-ctx-lead">' + IC.layers + ' Filter context <b>' + contextChips.length + '</b></span>'
+      + '<div class="dux-ctx-chips">' + chips + '</div>'
+      + '<button class="dux-btn-new" id="dux-ctx-new" title="Clear filter context">' + IC.refresh + ' New search</button>'
+      + '</div>';
+    const b = document.getElementById('dux-ctx-new');
+    b && b.addEventListener('click', newSearch);
+  }
+  // sessionStorage mirror (per-tab, like duxTabId) so the strip survives a page
+  // reload while the backend cache is still live, honouring the remaining TTL.
+  function persistContext(expiresAt) {
+    try {
+      if (contextChips.length) {
+        const slim = contextChips.map(function (c) { return { klabel: c.klabel, value: c.value, isNum: c.isNum }; });
+        sessionStorage.setItem('dux_ctx', JSON.stringify({ chips: slim, expiresAt: expiresAt }));
+      } else { sessionStorage.removeItem('dux_ctx'); }
+    } catch (e) {}
+  }
+  function expireContext() {
+    contextChips = []; contextTimer = null;
+    renderContextStrip(); input.placeholder = PH_DEFAULT;
+    try { sessionStorage.removeItem('dux_ctx'); } catch (e) {}
+  }
+  // Refresh the live context from a non-empty records turn (mirrors the server
+  // write). Resets the 4-min sliding timer; on expiry the strip + placeholder clear.
+  function setContext(normalized, rawIntent) {
+    contextChips = filtersToChips(normalized || [], rawIntent || null);
+    renderContextStrip();
+    input.placeholder = contextChips.length ? PH_REFINE : PH_DEFAULT;
+    if (contextTimer) { clearTimeout(contextTimer); contextTimer = null; }
+    if (contextChips.length) {
+      contextTimer = setTimeout(expireContext, CTX_TTL_MS);
+      persistContext(Date.now() + CTX_TTL_MS);
+    } else {
+      try { sessionStorage.removeItem('dux_ctx'); } catch (e) {}
+    }
+  }
+  function clearContext() {
+    contextChips = [];
+    if (contextTimer) { clearTimeout(contextTimer); contextTimer = null; }
+    renderContextStrip();
+    input.placeholder = PH_DEFAULT;
+    try { sessionStorage.removeItem('dux_ctx'); } catch (e) {}
+  }
+  // Restore a still-valid context after a reload (backend cache + per-tab id both
+  // survive reload, so the strip should too — for the remaining TTL only).
+  function restoreContext() {
+    let raw = null;
+    try { raw = sessionStorage.getItem('dux_ctx'); } catch (e) { return; }
+    if (!raw) return;
+    let data = null;
+    try { data = JSON.parse(raw); } catch (e) { data = null; }
+    if (!data || !Array.isArray(data.chips) || !data.chips.length || !data.expiresAt) { return clearContext(); }
+    const remaining = data.expiresAt - Date.now();
+    if (remaining <= 0) { return clearContext(); }
+    contextChips = data.chips;
+    renderContextStrip();
+    input.placeholder = PH_REFINE;
+    if (contextTimer) clearTimeout(contextTimer);
+    contextTimer = setTimeout(expireContext, remaining);
+  }
+
+  // =========================================================================
   // SUBMIT / actions
   // =========================================================================
   function submit() {
@@ -756,8 +863,18 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
       args: { message: text, tab_id: duxTabId() },
       callback: function (r) {
         const el = document.getElementById(tid); if (el) el.remove();
-        if (r && r.message) { addBot(r.message); }
-        else { addAssistantTurn('<span class="dux-err-text">No response from DUX.</span>', ''); }
+        const resp = r && r.message;
+        if (resp) {
+          addBot(resp);
+          // Mirror the backend cache write: ONLY a non-empty records turn
+          // (re)writes last_query, so only that refreshes the live context +
+          // resets its 4-min timer. Empty / unsupported / error leave it as-is.
+          if (resp.type === 'records' && (resp.count || 0) > 0) {
+            setContext(resp.normalized_filters, resp.intent);
+          }
+        } else {
+          addAssistantTurn('<span class="dux-err-text">No response from DUX.</span>', '');
+        }
         send.disabled = false; input.focus();
       },
       error: function () {
@@ -771,6 +888,7 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
   // "New search": fresh per-tab refinement context + clear the visible conversation
   function newSearch() {
     duxNewTabId();
+    clearContext();
     inner.innerHTML = '';
     renderEmpty();
     input.value = ''; autosize(); send.disabled = false;
@@ -803,5 +921,6 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
   newBtn && newBtn.addEventListener('click', newSearch);
 
   renderEmpty();
+  restoreContext();
   setTimeout(() => input.focus(), 200);
 };
