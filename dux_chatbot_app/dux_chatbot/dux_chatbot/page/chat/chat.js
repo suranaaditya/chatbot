@@ -410,7 +410,7 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
       </div>
       <div class="dux-composer-hint">
         <span class="dux-kbd"><kbd>↵</kbd> to send <span style="opacity:.5">·</span> <kbd>⇧↵</kbd> new line</span>
-        <span class="dux-powered"><span class="dux-gdot"></span> DUX reads only your authorised records</span>
+        <span class="dux-powered"><span class="dux-gdot"></span> DUX can make mistakes — double-check important results.</span>
       </div>
     </div></div>
   </div>`;
