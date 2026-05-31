@@ -169,13 +169,13 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
   .dux-stream{position:relative;z-index:2;flex:1 1 auto;overflow-y:auto;scroll-behavior:smooth;}
   .dux-stream::-webkit-scrollbar{width:10px;}
   .dux-stream::-webkit-scrollbar-thumb{background:var(--scrollthumb);border-radius:999px;border:3px solid var(--canvas);}
-  .dux-inner{max-width:860px;margin:0 auto;padding:30px 24px 26px;display:flex;flex-direction:column;gap:24px;}
+  .dux-inner{max-width:1160px;margin:0 auto;padding:30px 28px 26px;display:flex;flex-direction:column;gap:24px;}
   .dux-turn{animation:duxSettle .5s var(--spring) both;}
   @keyframes duxSettle{from{opacity:0;transform:translateY(12px);}to{opacity:1;transform:none;}}
 
   /* user message */
   .dux-msg-user{display:flex;flex-direction:column;align-items:flex-end;gap:5px;}
-  .dux-bubble-user{max-width:76%;background:var(--user-bg);border:1px solid var(--user-border);
+  .dux-bubble-user{max-width:640px;background:var(--user-bg);border:1px solid var(--user-border);
     color:var(--user-fg);padding:12px 16px;border-radius:16px 16px 5px 16px;
     font-size:14.5px;line-height:1.55;box-shadow:var(--inset-hi);white-space:pre-wrap;}
 
@@ -238,26 +238,27 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
 
   /* data table */
   .dux-tbl-scroll{overflow-x:auto;}
-  .dux-tbl{width:100%;border-collapse:collapse;font-size:13px;}
+  .dux-tbl{width:100%;border-collapse:collapse;font-size:13px;table-layout:auto;}
   .dux-tbl thead th{text-align:left;font-weight:600;font-size:10.5px;letter-spacing:.07em;
     text-transform:uppercase;color:var(--fg-3);padding:11px 16px;border-bottom:1px solid var(--hairline);
     white-space:nowrap;background:var(--th-bg);}
   .dux-tbl thead th.num,.dux-tbl tbody td.num{text-align:right;}
-  .dux-tbl tbody td{padding:12px 16px;border-bottom:1px solid var(--hairline);white-space:nowrap;color:var(--fg-1);}
+  .dux-tbl tbody td{padding:12px 16px;border-bottom:1px solid var(--hairline);color:var(--fg-1);
+    white-space:normal;vertical-align:middle;overflow-wrap:anywhere;}
   .dux-tbl tbody tr{transition:background .18s var(--ease);}
   .dux-tbl tbody tr:last-child td{border-bottom:none;}
   .dux-tbl tbody tr:hover{background:var(--row-hover);}
-  .dux-cell-id{font-family:var(--mono);color:var(--cyan);font-weight:600;cursor:pointer;}
+  .dux-cell-id{font-family:var(--mono);color:var(--cyan);font-weight:600;cursor:pointer;white-space:nowrap;}
   .dux-root a.dux-cell-id:hover{color:var(--cyan-soft);text-decoration:underline;}
-  .dux-cell-num{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--fg-1);font-weight:500;}
+  .dux-cell-num{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--fg-1);font-weight:500;white-space:nowrap;}
   .dux-cell-num .rs{color:var(--fg-3);margin-right:1px;}
-  .dux-cell-date{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--fg-2);font-size:12.5px;}
+  .dux-cell-date{font-family:var(--mono);font-variant-numeric:tabular-nums;color:var(--fg-2);font-size:12.5px;white-space:nowrap;}
   .dux-cell-sup{color:var(--fg-1);}
   .dux-cell-co{color:var(--fg-2);}
   .dux-empty-rows{padding:30px 18px;text-align:center;color:var(--fg-2);font-size:14px;}
 
   /* status tag */
-  .dux-tag{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;padding:3px 9px;border-radius:999px;font-weight:500;}
+  .dux-tag{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;padding:3px 9px;border-radius:999px;font-weight:500;white-space:nowrap;}
   .dux-tag .d{width:5px;height:5px;border-radius:50%;}
   .dux-tag.pending{color:var(--pending);background:var(--pending-bg);}.dux-tag.pending .d{background:var(--pending);}
   .dux-tag.approved{color:var(--ok);background:var(--ok-bg);}.dux-tag.approved .d{background:var(--ok);}
@@ -319,7 +320,7 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
   .dux-composer-zone{position:relative;z-index:5;flex:0 0 auto;padding:0 24px 22px;}
   .dux-composer-zone::before{content:"";position:absolute;left:0;right:0;top:-42px;height:42px;
     background:linear-gradient(180deg,transparent,var(--canvas));pointer-events:none;}
-  .dux-composer-inner{max-width:860px;margin:0 auto;}
+  .dux-composer-inner{max-width:1160px;margin:0 auto;}
 
   /* live filter-context strip (current refinement cache, above the composer) */
   .dux-ctx-strip{display:flex;align-items:center;gap:10px;margin-bottom:10px;padding:7px 8px 7px 13px;
