@@ -16,19 +16,15 @@ def _ollama_url() -> str:
 
 
 # =============================================================================
-# CONFIG ACCESSORS — dual-read layer for the config-registry refactor.
-# The four PER-DOCTYPE config layers are consolidated into ONE `chatbot_registry`
-# object keyed by DocType; these accessors PREFER the registry and FALL BACK to
-# the legacy flat keys, so the migration is reversible and behavior-identical.
-#
-# ALL-OR-NOTHING: if `chatbot_registry` exists and is non-empty it is the COMPLETE
-# source of truth and the legacy keys (chatbot_doctypes / _vocabulary /
-# _field_aliases / _status_aliases) are IGNORED — there is NO half-registry /
-# half-legacy merge. Once the registry is verified on a site, the legacy keys are
-# deleted with no behavior change (separate follow-up commit). The accessors are
-# the single place the eventual deletion touches.
-# `chatbot_company_aliases` is GLOBAL (not per-doctype) and is ALWAYS read
-# top-level — it never moves into the registry.
+# CONFIG ACCESSORS — `chatbot_registry` is the SOLE per-doctype config source.
+# The four per-doctype config layers were consolidated into ONE `chatbot_registry`
+# object keyed by DocType (migration 20c40a5; the flat legacy keys it replaced —
+# chatbot_doctypes / _vocabulary / _field_aliases / _status_aliases — were then
+# DELETED). These accessors read the registry ONLY: if it is absent they return
+# empty (no doctypes / no aliases) — the correct LOUD failure, NOT a silent revert
+# to stale config.
+# `chatbot_company_aliases` is GLOBAL (not per-doctype), was never in the registry,
+# and is retained — read top-level via _cfg_company_aliases().
 #
 # Registry shape:
 #   {"<DocType>": {"vocab": ["<term>", ...],
@@ -41,42 +37,30 @@ def _cfg_registry() -> dict:
 
 
 def _cfg_doctypes() -> list:
-    """Allow-list. Registry keys when the registry is present, else the legacy
-    chatbot_doctypes list. Dict insertion order is preserved, so registry key
-    order == the old list order (keeps the prompt's DocType block stable)."""
-    reg = _cfg_registry()
-    return list(reg.keys()) if reg else (frappe.conf.get("chatbot_doctypes") or [])
+    """Allow-list = registry keys (insertion order preserved, so the prompt's
+    DocType block order stays stable). Empty if the registry is absent."""
+    return list(_cfg_registry().keys())
 
 
 def _cfg_vocabulary() -> dict:
-    """FLAT {term: doctype} — the shape _call_llm consumes. From the registry,
-    invert per-doctype {dt: [terms]} -> {term: dt}. Non-empty iff the source is
-    non-empty (_call_llm keys prompt_variant off vocab presence, so an empty
-    flatten would flip the variant). Else the legacy flat chatbot_vocabulary."""
-    reg = _cfg_registry()
-    if reg:
-        out = {}
-        for dt, entry in reg.items():
-            for term in ((entry or {}).get("vocab") or []):
-                out[term] = dt
-        return out
-    return frappe.conf.get("chatbot_vocabulary") or {}
+    """FLAT {term: doctype} — the shape _call_llm consumes — inverted from the
+    registry's per-doctype {dt: [terms]}. Non-empty iff the registry has vocab
+    terms (_call_llm keys prompt_variant off vocab presence)."""
+    out = {}
+    for dt, entry in _cfg_registry().items():
+        for term in ((entry or {}).get("vocab") or []):
+            out[term] = dt
+    return out
 
 
 def _cfg_field_aliases(doctype: str) -> dict:
-    """Per-doctype {alias: field}. Registry-first, else legacy chatbot_field_aliases."""
-    reg = _cfg_registry()
-    if reg:
-        return (reg.get(doctype) or {}).get("field_aliases", {})
-    return (frappe.conf.get("chatbot_field_aliases") or {}).get(doctype, {})
+    """Per-doctype {alias: field} from the registry."""
+    return (_cfg_registry().get(doctype) or {}).get("field_aliases", {})
 
 
 def _cfg_status_aliases(doctype: str) -> dict:
-    """Per-doctype {term: {field, values}}. Registry-first, else legacy chatbot_status_aliases."""
-    reg = _cfg_registry()
-    if reg:
-        return (reg.get(doctype) or {}).get("status_aliases", {})
-    return (frappe.conf.get("chatbot_status_aliases") or {}).get(doctype, {})
+    """Per-doctype {term: {field, values}} from the registry."""
+    return (_cfg_registry().get(doctype) or {}).get("status_aliases", {})
 
 
 def _cfg_company_aliases() -> dict:
