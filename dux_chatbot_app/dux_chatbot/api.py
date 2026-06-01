@@ -761,7 +761,29 @@ def _handle_read(intent: dict) -> dict:
 # (total actual_qty + per-warehouse breakdown), NOT a document row-list. This is an
 # ADDITIVE branch alongside _handle_read; the document read path is unchanged.
 # =============================================================================
-def _handle_stock(intent: dict) -> dict:
+# Words stripped from a stock query when recovering the item from the raw message
+# (used ONLY when the model extracted no filter — see _handle_stock). Lower-cased.
+_STOCK_STOPWORDS = frozenset({
+    "stock", "stocks", "quantity", "qty", "how", "much", "many", "in", "available",
+    "availability", "level", "levels", "of", "the", "do", "we", "have", "has", "what",
+    "whats", "is", "are", "item", "items", "only", "a", "an", "at", "for", "me", "my",
+    "show", "give", "get", "can", "you", "current", "currently", "on", "hand", "all",
+    "please", "tell", "there", "any", "left", "remaining", "with", "us",
+})
+_WORD_RE = re.compile(r"[A-Za-z0-9]+")
+
+
+def _stock_item_phrase(message: str) -> str:
+    """Recover the item phrase from a stock query when the model emitted no filter
+    (it under-extracts lowercase single-word items: 'stock of petrol' -> {}). Strip
+    the stock/filler words; the remainder is matched loosely against item_code."""
+    if not message:
+        return ""
+    kept = [w for w in _WORD_RE.findall(str(message).lower()) if w not in _STOCK_STOPWORDS]
+    return " ".join(kept).strip()
+
+
+def _handle_stock(intent: dict, message: str = "") -> dict:
     """Stock-on-hand answer for the Bin doctype: current actual_qty per item per
     warehouse, AGGREGATED into a per-item total + per-warehouse breakdown — the
     shape "what is the stock of X" wants (a number, not a row list). actual_qty
@@ -774,6 +796,12 @@ def _handle_stock(intent: dict) -> dict:
     _normalize_filters' loose-Link output (Bin.item_code is a Link to Item, so
     "100mm DI" -> ["item_code","like","%100mm DI%"]); a loose match can hit MULTIPLE
     items ("stock of pipe") -> each is returned with its own total (user refines).
+
+    ITEM RECOVERY: the classifier under-extracts the item for lowercase single-word
+    queries ('stock of petrol' -> {} -> would otherwise dump ALL stock). When it
+    emits NO filter at all, recover the item phrase from the raw message and apply a
+    loose item_code match. (The 'item'/'item_name' field-name guess is handled
+    separately by the Bin field_aliases in the registry.)
     """
     if "Bin" not in _cfg_doctypes():
         return {"type": "unsupported", "intent": intent,
@@ -783,6 +811,13 @@ def _handle_stock(intent: dict) -> dict:
     except _FilterError as e:
         return {"type": "error", "intent": intent, "message": str(e),
                 "error_kind": "query_error"}
+    # The model extracted nothing (empty filter) — recover the item from the message
+    # so a lowercase 'stock of petrol' resolves to Petrol, not every item. Only when
+    # NOTHING was extracted; if the model gave any filter, trust it.
+    if not filters:
+        phrase = _stock_item_phrase(message)
+        if phrase:
+            filters = [["item_code", "like", "%" + _like_escape(phrase) + "%"]]
     try:
         rows = frappe.get_list(
             "Bin",
@@ -974,7 +1009,7 @@ def handle_message(message: str, tab_id: str = None) -> dict:
             # Bin = stock-on-hand: an AGGREGATE answer (total + per-warehouse), not a
             # document row-list. Intercept BEFORE the generic read so it never falls
             # through to the row-renderer (or the Item card — the bug we're fixing).
-            response = (_handle_stock(effective_intent) if doctype == "Bin"
+            response = (_handle_stock(effective_intent, message) if doctype == "Bin"
                         else _handle_read(effective_intent))
             rtype = response.get("type")
             if rtype == "records":

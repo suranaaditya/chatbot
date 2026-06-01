@@ -265,6 +265,7 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
   .dux-stock-qnum{font-family:var(--mono);font-variant-numeric:tabular-nums;font-weight:600;color:var(--cyan);}
   .dux-stock-qty .dux-stock-qnum{font-size:22px;}
   .dux-stock-uom{font-size:12.5px;font-weight:500;color:var(--fg-3);margin-left:5px;}
+  .dux-stock-whmore{color:var(--fg-3);font-family:var(--mono);font-size:11.5px;}
 
   /* status tag */
   .dux-tag{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;padding:3px 9px;border-radius:999px;font-weight:500;white-space:nowrap;}
@@ -820,6 +821,13 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
       + '<tbody>' + rows + '</tbody></table></div>';
   }
 
+  function stockWarehouseLabel(it) {
+    const pw = it.per_warehouse || [];   // ordered by qty desc (backend) -> biggest first
+    if (!pw.length) return '—';
+    if (pw.length === 1) return esc(fmtCell(pw[0].warehouse));
+    return esc(fmtCell(pw[0].warehouse)) + ' <span class="dux-stock-whmore">+' + (pw.length - 1) + '</span>';
+  }
+
   function addBotStock(payload) {
     const items = payload.items || [];
     const normalized = payload.normalized_filters || [];
@@ -851,16 +859,15 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
     const text = 'Found stock for <span class="dux-accent-n">' + items.length + '</span> items'
       + (label ? ' matching <b>' + esc(label) + '</b>' : '') + '.';
     const rows = items.map(function (it) {
-      const wh = (it.per_warehouse || []).length;
       return '<tr><td class="dux-cell-sup">' + esc(String(it.item_code)) + '</td>'
         + '<td class="num"><span class="dux-stock-qnum">' + esc(inr(it.total_qty)) + '</span>'
         + '<span class="dux-stock-uom">' + esc(stockUnit(it)) + '</span></td>'
-        + '<td class="num dux-cell-num">' + wh + '</td></tr>';
+        + '<td class="dux-cell-co">' + stockWarehouseLabel(it) + '</td></tr>';
     }).join('');
     const card = '<div class="dux-result-card">' + pills
       + '<div class="dux-result-meta"><span class="dux-count"><b>' + items.length + '</b> items</span></div>'
       + '<div class="dux-tbl-scroll"><table class="dux-tbl"><thead><tr><th>Item</th>'
-      + '<th class="num">In stock</th><th class="num">Warehouses</th></tr></thead>'
+      + '<th class="num">In stock</th><th>Warehouse(s)</th></tr></thead>'
       + '<tbody>' + rows + '</tbody></table></div></div>';
     return addAssistantTurn(text, card);
   }

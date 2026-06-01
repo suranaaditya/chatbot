@@ -180,6 +180,18 @@ EVAL_CASES = [
      "intent": "read", "doctype": "Bin", "resp_type": "stock"},
     {"id": "stock_phrasing_level", "query": "stock level of Petrol", "kind": "level2",
      "intent": "read", "doctype": "Bin", "resp_type": "stock"},
+    # regression guards for the real-browser bugs: a LOWERCASE item -> the model emits
+    # {} (would dump ALL stock) -> recovered from the message text; and the "item"
+    # field-name guess -> Bin field_aliases maps it to item_code. All must resolve to
+    # ONLY Petrol (stock_items=1, total 10546) — these FAILED before the fix.
+    {"id": "stock_lowercase", "query": "stock of petrol", "kind": "level2",
+     "intent": "read", "doctype": "Bin", "resp_type": "stock", "stock_items": 1, "stock_total": 10546},
+    {"id": "stock_item_word", "query": "stock of item petrol only", "kind": "level2",
+     "intent": "read", "doctype": "Bin", "resp_type": "stock", "stock_items": 1, "stock_total": 10546},
+    {"id": "stock_question", "query": "stock of petrol ?", "kind": "level2",
+     "intent": "read", "doctype": "Bin", "resp_type": "stock", "stock_items": 1, "stock_total": 10546},
+    {"id": "stock_howmuch_lower", "query": "how much petrol do we have", "kind": "level2",
+     "intent": "read", "doctype": "Bin", "resp_type": "stock", "stock_items": 1, "stock_total": 10546},
 
     # ---- refine-vs-fresh classification steer (p15-6) — seeded cases warm the
     #      cache so the REFINEMENT prompt fires (variant-sanity in _checks_for
@@ -356,6 +368,8 @@ def _checks_for(case, rec):
                        bool(its) and len(pw) == case["stock_warehouses"]
                        and abs(sum(x.get("actual_qty") or 0 for x in pw)
                                - float(its[0].get("total_qty") or 0)) < 0.5))
+    if "stock_items" in case:
+        checks.append(("stock_items", len(resp.get("items") or []) == case["stock_items"]))
     exp_variant = "with_vocab_and_refinement" if case.get("seed") else "with_vocab"
     checks.append(("variant", variant == exp_variant))
     info = (f"intent={intent} dt={doctype} variant={variant} "
