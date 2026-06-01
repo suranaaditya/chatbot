@@ -257,6 +257,15 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
   .dux-cell-co{color:var(--fg-2);}
   .dux-empty-rows{padding:30px 18px;text-align:center;color:var(--fg-2);font-size:14px;}
 
+  /* stock view — headline total (sibling of the result card) */
+  .dux-stock-headline{display:flex;align-items:baseline;justify-content:space-between;gap:14px;
+    padding:15px 17px;border-bottom:1px solid var(--hairline);}
+  .dux-stock-name{font-size:15px;font-weight:600;color:var(--fg-1);letter-spacing:-.01em;overflow-wrap:anywhere;}
+  .dux-stock-qty{white-space:nowrap;text-align:right;}
+  .dux-stock-qnum{font-family:var(--mono);font-variant-numeric:tabular-nums;font-weight:600;color:var(--cyan);}
+  .dux-stock-qty .dux-stock-qnum{font-size:22px;}
+  .dux-stock-uom{font-size:12.5px;font-weight:500;color:var(--fg-3);margin-left:5px;}
+
   /* status tag */
   .dux-tag{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;padding:3px 9px;border-radius:999px;font-weight:500;white-space:nowrap;}
   .dux-tag .d{width:5px;height:5px;border-radius:50%;}
@@ -673,6 +682,7 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
     }
     const type = response && response.type;
     if (type === 'records') return addBotRecords(response);
+    if (type === 'stock') return addBotStock(response);
     if (type === 'unsupported') return addAssistantTurn(esc(response.message || 'Not supported yet.'), '');
     if (type === 'error') return addAssistantTurn('<span class="dux-err-text">' + esc(response.message || 'Something went wrong.') + '</span>', '');
     return addAssistantTurn('<span class="dux-err-text">Unexpected response from DUX.</span>', '');
@@ -771,6 +781,88 @@ frappe.pages['chat'].on_page_load = function (wrapper) {
       + '</div>';
 
     addAssistantTurn(text, card);
+  }
+
+  // =========================================================================
+  // STOCK VIEW (stock-querying piece 2) — renders the backend's type:"stock"
+  // shape (Bin aggregate): a headline total + per-warehouse actual_qty table,
+  // reusing the result-card / pills / table chrome. Single item -> headline +
+  // warehouse table; many items -> a compact per-item summary table (no wall of
+  // tables); empty -> a friendly message. actual_qty only (per Piece 1).
+  // =========================================================================
+  function stockUnit(it) {
+    const u = it && it.stock_uom;
+    return (u && String(u).trim()) ? String(u).trim() : 'units';
+  }
+  function stockFilterLabel(normalized) {
+    for (let i = 0; i < (normalized || []).length; i++) {
+      const c = normalized[i];
+      if (Array.isArray(c) && /item|product/.test(String(c[0]).toLowerCase())) {
+        return titleCase(stripLike(String(c.length >= 3 ? c[2] : '')));
+      }
+    }
+    return '';
+  }
+  function stockHeadlineBar(it) {
+    return '<div class="dux-stock-headline">'
+      + '<span class="dux-stock-name">' + esc(String(it.item_code)) + '</span>'
+      + '<span class="dux-stock-qty"><span class="dux-stock-qnum">' + esc(inr(it.total_qty))
+      + '</span><span class="dux-stock-uom">' + esc(stockUnit(it)) + '</span></span></div>';
+  }
+  function stockWarehouseTable(it) {
+    const unit = stockUnit(it);
+    const rows = (it.per_warehouse || []).map(function (w) {
+      return '<tr><td class="dux-cell-sup">' + esc(fmtCell(w.warehouse)) + '</td>'
+        + '<td class="num"><span class="dux-stock-qnum">' + esc(inr(w.actual_qty)) + '</span></td></tr>';
+    }).join('');
+    return '<div class="dux-tbl-scroll"><table class="dux-tbl"><thead><tr><th>Warehouse</th>'
+      + '<th class="num">Qty' + (unit !== 'units' ? ' (' + esc(unit) + ')' : '') + '</th></tr></thead>'
+      + '<tbody>' + rows + '</tbody></table></div>';
+  }
+
+  function addBotStock(payload) {
+    const items = payload.items || [];
+    const normalized = payload.normalized_filters || [];
+    const pills = pillsBarHTML(filtersToChips(normalized, payload.intent || null));
+    const label = stockFilterLabel(normalized);
+
+    // EMPTY — friendly message; do NOT fall back to the Item card (the bug we fixed).
+    if (!items.length) {
+      const text = 'No stock records found' + (label ? ' for <b>' + esc(label) + '</b>' : '') + '.';
+      const card = '<div class="dux-result-card">' + pills
+        + '<div class="dux-empty-rows">No stock on hand matched that — try a different item name, or start a new search.</div>'
+        + '</div>';
+      return addAssistantTurn(text, card);
+    }
+
+    // SINGLE ITEM — headline total + per-warehouse table.
+    if (items.length === 1) {
+      const it = items[0];
+      const wh = (it.per_warehouse || []).length;
+      const text = '<b>' + esc(String(it.item_code)) + '</b> — <span class="dux-accent-n">'
+        + esc(inr(it.total_qty)) + '</span> ' + esc(stockUnit(it)) + ' in stock'
+        + (wh > 1 ? ' across <span class="dux-accent-n">' + wh + '</span> warehouses' : '') + '.';
+      const card = '<div class="dux-result-card">' + pills
+        + stockHeadlineBar(it) + stockWarehouseTable(it) + '</div>';
+      return addAssistantTurn(text, card);
+    }
+
+    // MULTIPLE ITEMS — one compact summary row per item (avoid a wall of tables).
+    const text = 'Found stock for <span class="dux-accent-n">' + items.length + '</span> items'
+      + (label ? ' matching <b>' + esc(label) + '</b>' : '') + '.';
+    const rows = items.map(function (it) {
+      const wh = (it.per_warehouse || []).length;
+      return '<tr><td class="dux-cell-sup">' + esc(String(it.item_code)) + '</td>'
+        + '<td class="num"><span class="dux-stock-qnum">' + esc(inr(it.total_qty)) + '</span>'
+        + '<span class="dux-stock-uom">' + esc(stockUnit(it)) + '</span></td>'
+        + '<td class="num dux-cell-num">' + wh + '</td></tr>';
+    }).join('');
+    const card = '<div class="dux-result-card">' + pills
+      + '<div class="dux-result-meta"><span class="dux-count"><b>' + items.length + '</b> items</span></div>'
+      + '<div class="dux-tbl-scroll"><table class="dux-tbl"><thead><tr><th>Item</th>'
+      + '<th class="num">In stock</th><th class="num">Warehouses</th></tr></thead>'
+      + '<tbody>' + rows + '</tbody></table></div></div>';
+    return addAssistantTurn(text, card);
   }
 
   // =========================================================================
