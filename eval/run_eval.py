@@ -157,9 +157,29 @@ EVAL_CASES = [
      "intent": "read", "doctype": "Purchase Invoice",
      "filters": [["status", "in", ["Paid"]]]},
 
-    # ---- level-3 only: value-specific item lookup (field varies item_name/item_code) ----
-    {"id": "item_specific", "query": "can you give me stock of 200mm DI", "kind": "level3",
+    # ---- level-3 only: value-specific item lookup (field varies item_name/item_code).
+    #      Phrasing AVOIDS the word "stock" — that's now a Bin vocab term, so "stock of
+    #      <item>" intentionally routes to Bin (the stock feature). This case tests the
+    #      Item-master value lookup, so it names the item plainly. ----
+    {"id": "item_specific", "query": "show me item 100mm DI", "kind": "level3",
      "intent": "read", "doctype": "Item", "nonempty": True},
+
+    # ---- STOCK QUERYING (piece 1) — Bin aggregate. Test item Petrol: 5 warehouses,
+    #      total actual_qty = 10546. THE routing test: "stock/quantity/how many" must hit
+    #      doctype=Bin (was "Item" -> the Item card before). If routing is flaky across the
+    #      phrasings below, Option A's vocab steer is insufficient -> escalate to Option B
+    #      (dedicated intent). resp_type/stock_total assert the AGGREGATE itself is right. ----
+    {"id": "stock_routing", "query": "what is the stock of Petrol", "kind": "level2",
+     "intent": "read", "doctype": "Bin", "resp_type": "stock", "stock_total": 10546, "nonempty": True},
+    {"id": "stock_howmany", "query": "how many Petrol do we have", "kind": "level2",
+     "intent": "read", "doctype": "Bin", "resp_type": "stock", "stock_total": 10546},
+    {"id": "stock_warehouse_breakdown", "query": "stock of Petrol", "kind": "level2",
+     "intent": "read", "doctype": "Bin", "resp_type": "stock", "stock_warehouses": 5},
+    # routing robustness — distinct phrasings must ALL hit Bin (the A-viability signal):
+    {"id": "stock_phrasing_instock", "query": "how much Petrol do we have in stock", "kind": "level2",
+     "intent": "read", "doctype": "Bin", "resp_type": "stock"},
+    {"id": "stock_phrasing_level", "query": "stock level of Petrol", "kind": "level2",
+     "intent": "read", "doctype": "Bin", "resp_type": "stock"},
 
     # ---- refine-vs-fresh classification steer (p15-6) — seeded cases warm the
     #      cache so the REFINEMENT prompt fires (variant-sanity in _checks_for
@@ -282,13 +302,18 @@ def _patch(api):
 
 def _invoke(api, query):
     """Run the real handle_message; return the captured record (populated even
-    if handle_message re-raises, since _log_turn runs in its finally)."""
+    if handle_message re-raises, since _log_turn runs in its finally). The
+    handle_message RETURN value (the response dict) is attached as rec['_response']
+    so response-shape checks (e.g. the stock aggregate) can assert on it."""
     _captured.clear()
+    resp = None
     try:
-        api.handle_message(query)
+        resp = api.handle_message(query)
     except Exception as e:  # defensive: handler_error path re-raises post-capture
         _captured.setdefault("_exception", repr(e))
-    return dict(_captured)
+    rec = dict(_captured)
+    rec["_response"] = resp
+    return rec
 
 
 def _checks_for(case, rec):
@@ -315,10 +340,29 @@ def _checks_for(case, rec):
                        not any(s in (nfj or "") for s in case["carried_absent"])))
     if case.get("nonempty"):
         checks.append(("nonempty", count > 0))
+    # response-shape checks (stock-querying piece 1) — read the attached response.
+    resp = rec.get("_response") or {}
+    if "resp_type" in case:
+        checks.append(("resp_type", resp.get("type") == case["resp_type"]))
+    if "stock_total" in case:
+        its = resp.get("items") or []
+        tot = its[0].get("total_qty") if its else None
+        checks.append(("stock_total",
+                       tot is not None and abs(float(tot) - float(case["stock_total"])) < 0.5))
+    if "stock_warehouses" in case:
+        its = resp.get("items") or []
+        pw = its[0].get("per_warehouse") if its else []
+        checks.append(("stock_warehouses",
+                       bool(its) and len(pw) == case["stock_warehouses"]
+                       and abs(sum(x.get("actual_qty") or 0 for x in pw)
+                               - float(its[0].get("total_qty") or 0)) < 0.5))
     exp_variant = "with_vocab_and_refinement" if case.get("seed") else "with_vocab"
     checks.append(("variant", variant == exp_variant))
     info = (f"intent={intent} dt={doctype} variant={variant} "
             f"outcome={rec.get('outcome')} count={count} filters={actual}")
+    if resp.get("type") == "stock":
+        info += " stock=" + str([(i.get("item_code"), i.get("total_qty"), len(i.get("per_warehouse") or []))
+                                 for i in (resp.get("items") or [])])
     return checks, info
 
 

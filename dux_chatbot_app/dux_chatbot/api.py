@@ -757,6 +757,73 @@ def _handle_read(intent: dict) -> dict:
 
 
 # =============================================================================
+# STOCK HANDLER (stock-querying piece 1) — doctype "Bin" needs an AGGREGATE answer
+# (total actual_qty + per-warehouse breakdown), NOT a document row-list. This is an
+# ADDITIVE branch alongside _handle_read; the document read path is unchanged.
+# =============================================================================
+def _handle_stock(intent: dict) -> dict:
+    """Stock-on-hand answer for the Bin doctype: current actual_qty per item per
+    warehouse, AGGREGATED into a per-item total + per-warehouse breakdown — the
+    shape "what is the stock of X" wants (a number, not a row list). actual_qty
+    ONLY (projected/reserved omitted — users found them confusing).
+
+    PERMISSION model is identical to _handle_read: the get_list runs IN-PROCESS as
+    frappe.session.user, so a role-less user hits the SAME permission_denied path
+    (Bin read is role-gated to Stock/Sales/Purchase User+Manager). No bypass, no
+    get_latest_stock_qty (which would skip per-user perms). Item resolution reuses
+    _normalize_filters' loose-Link output (Bin.item_code is a Link to Item, so
+    "100mm DI" -> ["item_code","like","%100mm DI%"]); a loose match can hit MULTIPLE
+    items ("stock of pipe") -> each is returned with its own total (user refines).
+    """
+    if "Bin" not in _cfg_doctypes():
+        return {"type": "unsupported", "intent": intent,
+                "message": "Stock lookups aren't set up yet."}
+    try:
+        filters = _normalize_filters("Bin", intent.get("filters", {}))
+    except _FilterError as e:
+        return {"type": "error", "intent": intent, "message": str(e),
+                "error_kind": "query_error"}
+    try:
+        rows = frappe.get_list(
+            "Bin",
+            filters=filters,
+            fields=["item_code", "warehouse", "actual_qty", "stock_uom"],
+            limit_page_length=0,  # aggregate needs ALL warehouse rows (Bin is small)
+            order_by="item_code asc, actual_qty desc",
+        )
+    except frappe.PermissionError:
+        return {"type": "error", "intent": intent,
+                "message": "You don't have permission to view stock levels.",
+                "error_kind": "permission_denied"}
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "Chatbot stock query_error")
+        return {"type": "error", "intent": intent,
+                "message": "I couldn't look up that stock — try naming the item differently.",
+                "error_kind": "query_error"}
+
+    # aggregate actual_qty by item_code (first-seen order preserved)
+    agg, order = {}, []
+    for r in rows:
+        ic = r.get("item_code")
+        if ic not in agg:
+            agg[ic] = {"item_code": ic, "stock_uom": r.get("stock_uom"),
+                       "total_qty": 0.0, "per_warehouse": []}
+            order.append(ic)
+        agg[ic]["total_qty"] += (r.get("actual_qty") or 0)
+        agg[ic]["per_warehouse"].append({"warehouse": r.get("warehouse"),
+                                         "actual_qty": r.get("actual_qty") or 0})
+    items = [agg[ic] for ic in order]
+    return {
+        "type": "stock",
+        "intent": intent,
+        "doctype": "Bin",
+        "items": items,
+        "count": len(items),
+        "normalized_filters": filters,  # the item filter, for the read-only pills
+    }
+
+
+# =============================================================================
 # LOGGING — persist every turn to the Chatbot Log DocType.
 # Logging MUST NOT break the user flow: _log_turn swallows ALL errors.
 #
@@ -903,10 +970,14 @@ def handle_message(message: str, tab_id: str = None) -> dict:
             else:
                 effective_intent = intent
 
-            response = _handle_read(effective_intent)
+            doctype = effective_intent.get("doctype")
+            # Bin = stock-on-hand: an AGGREGATE answer (total + per-warehouse), not a
+            # document row-list. Intercept BEFORE the generic read so it never falls
+            # through to the row-renderer (or the Item card — the bug we're fixing).
+            response = (_handle_stock(effective_intent) if doctype == "Bin"
+                        else _handle_read(effective_intent))
             rtype = response.get("type")
             if rtype == "records":
-                doctype = effective_intent.get("doctype")
                 eff_filters = effective_intent.get("filters", {})
                 normalized = _normalize_filters(doctype, eff_filters)
                 record["normalized_filters_json"] = json.dumps(normalized, default=str)
@@ -924,6 +995,14 @@ def handle_message(message: str, tab_id: str = None) -> dict:
                         filters=eff_filters,
                         fields=response.get("fields", []),
                     )
+            elif rtype == "stock":
+                # Bin aggregate: log like a read (so the turn is auditable), but do
+                # NOT cache for refinement in Piece 1 (stock refinement is a follow-up).
+                norm = response.get("normalized_filters") or []
+                record["normalized_filters_json"] = json.dumps(norm, default=str)
+                record["executed_call"] = f"frappe.get_list(Bin, filters={norm}) [stock aggregate]"
+                record["result_count"] = response.get("count", 0)
+                record["outcome"] = "success" if response.get("count", 0) > 0 else "empty"
             elif rtype == "unsupported":
                 record["outcome"] = "unsupported"
             else:  # type == "error": unknown doctype, permission, or query error
